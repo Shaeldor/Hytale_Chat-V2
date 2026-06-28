@@ -16,6 +16,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 class Overlay(QtWidgets.QWidget):
     submitted = QtCore.pyqtSignal(str)          # emitted with composed plaintext
     collapsed_changed = QtCore.pyqtSignal()     # emitted after collapse/expand (resize)
+    escape_to_game = QtCore.pyqtSignal()        # ESC collapsed us -> hand focus back to game
 
     def __init__(self, recipient: str, friends: list[str], font_size: int = 14):
         super().__init__()
@@ -166,6 +167,7 @@ class Overlay(QtWidgets.QWidget):
     def _on_escape(self) -> None:
         if not self._collapsed:
             self.set_collapsed(True)
+            self.escape_to_game.emit()         # return focus to the game (wired on Windows)
 
     # ---- dragging (frameless: grab the header / empty area, not the text widgets) ----
 

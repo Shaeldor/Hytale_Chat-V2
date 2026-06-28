@@ -15,6 +15,7 @@ Requires `pip install frida` (bundled by setup-windows.bat). If frida or quiche.
 isn't present, app.py falls back to the memory scanner.
 """
 
+import threading
 import time
 
 from . import crypto, memio
@@ -78,8 +79,54 @@ else {
 """
 
 
+# Tiny probe: resolve the hooked export across all loaded modules and report which
+# module holds it. Run via a Frida script (JS-side Process.enumerateModules) on
+# purpose -- Frida 17 dropped the Python Session.enumerate_modules(), so the old
+# check raised AttributeError and silently disabled the fast path, sending everyone
+# back to the slow memory scanner. JS enumeration still works and finds the export
+# whether quiche ships as a separate DLL or is statically linked into the client.
+_PROBE = r"""
+function resolve(name){
+  for (const m of Process.enumerateModules()){
+    let e = null;
+    try { e = m.findExportByName ? m.findExportByName(name) : null; } catch (_) {}
+    if (!e) { try { e = m.getExportByName(name); } catch (_) {} }
+    if (e) return m.name;
+  }
+  return null;
+}
+send({mod: resolve('quiche_conn_stream_recv')});
+"""
+
+
+def _export_module(pid: int):
+    """Module name exporting quiche_conn_stream_recv in `pid`, or None if absent."""
+    import frida
+
+    proc = frida.attach(pid)
+    box = {"mod": None}
+    done = threading.Event()
+
+    def on_msg(message, _data):
+        if message.get("type") == "send":
+            box["mod"] = (message.get("payload") or {}).get("mod")
+        done.set()
+
+    try:
+        script = proc.create_script(_PROBE)
+        script.on("message", on_msg)
+        script.load()
+        done.wait(3.0)
+        return box["mod"]
+    finally:
+        try:
+            proc.detach()
+        except Exception:
+            pass
+
+
 def available() -> bool:
-    """True if we can run the quiche hook: frida importable and quiche.DLL loaded."""
+    """True if we can run the quiche hook: frida importable and the export resolvable."""
     try:
         import frida  # noqa: F401
     except Exception:
@@ -88,16 +135,14 @@ def available() -> bool:
     if pid is None:
         return True            # client not up yet; watch() will wait and retry
     try:
-        import frida
-        proc = frida.attach(pid)
-        try:
-            for m in proc.enumerate_modules():
-                if "quiche" in m.name.lower():
-                    return True
-            return False
-        finally:
-            proc.detach()
-    except Exception:
+        mod = _export_module(pid)
+        if mod:
+            print(f"[quiche] hook available: quiche_conn_stream_recv in {mod}", flush=True)
+            return True
+        print("[quiche] quiche_conn_stream_recv not found in client modules", flush=True)
+        return False
+    except Exception as e:     # surface the reason; don't silently fall back
+        print(f"[quiche] availability probe failed: {e!r}", flush=True)
         return False
 
 

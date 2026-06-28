@@ -13,6 +13,7 @@ Win+Shift+P is reserved by Windows, so it's not the default. Configurable from a
 """
 
 import ctypes
+import time
 from ctypes import wintypes
 
 from PyQt6 import QtCore
@@ -22,6 +23,10 @@ MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x0001, 0x0002, 0x0004, 0x0008
 MOD_NOREPEAT = 0x4000
 GW_OWNER = 4
 SW_RESTORE = 9
+SW_SHOW = 5
+SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+SPIF_SENDCHANGE = 0x0002
 
 _MODS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
          "shift": MOD_SHIFT, "win": MOD_WIN, "super": MOD_WIN, "meta": MOD_WIN}
@@ -67,12 +72,17 @@ def _user32():
     u.AttachThreadInput.restype = wintypes.BOOL
     u.IsWindowVisible.argtypes = [wintypes.HWND]
     u.IsWindowVisible.restype = wintypes.BOOL
+    u.IsIconic.argtypes = [wintypes.HWND]
+    u.IsIconic.restype = wintypes.BOOL
     u.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
     u.GetWindow.restype = wintypes.HWND
     u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
     u.GetWindowTextLengthW.restype = ctypes.c_int
     u.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
     u.EnumWindows.restype = wintypes.BOOL
+    u.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT,
+                                        ctypes.c_void_p, wintypes.UINT]
+    u.SystemParametersInfoW.restype = wintypes.BOOL
     return u
 
 
@@ -104,21 +114,55 @@ def find_game_hwnd(pid: int):
     return found[0] if found else None
 
 
-def _force_foreground(hwnd) -> None:
-    """Bring hwnd to the foreground past the focus-steal lock via AttachThreadInput
-    (no synthetic keypresses, so the game never receives a stray ALT)."""
+def _force_foreground(hwnd) -> bool:
+    """Make hwnd the foreground window past Windows' focus-steal defences. Returns
+    whether hwnd actually ended up foreground.
+
+    Three things block a background process from taking focus: the foreground *lock
+    timeout*, thread-input isolation, and Z-order. We clear the lock timeout for the
+    moment (then restore it), attach to the current foreground thread's input queue so
+    Windows treats the change as user-initiated, and only then set foreground/focus.
+    No synthetic keypresses, so the game never receives a stray ALT.
+
+    Only un-minimize (SW_RESTORE) when the window is actually iconic -- calling
+    SW_RESTORE unconditionally un-maximizes a fullscreen window (that was why returning
+    focus to the game used to visibly shrink it out of fullscreen)."""
     u, k = _user32(), _kernel32()
-    u.ShowWindow(hwnd, SW_RESTORE)
+    hwnd = wintypes.HWND(int(hwnd))
+    if u.IsIconic(hwnd):
+        u.ShowWindow(hwnd, SW_RESTORE)
+
+    old = wintypes.DWORD(0)
+    u.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(old), 0)
+    u.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ctypes.c_void_p(0),
+                            SPIF_SENDCHANGE)
+
     target = u.GetWindowThreadProcessId(u.GetForegroundWindow(), None)
     mine = k.GetCurrentThreadId()
     attached = bool(target and target != mine and u.AttachThreadInput(mine, target, True))
     try:
         u.BringWindowToTop(hwnd)
-        u.SetForegroundWindow(hwnd)
+        u.ShowWindow(hwnd, SW_SHOW)
+        set_ok = bool(u.SetForegroundWindow(hwnd))
         u.SetFocus(hwnd)
     finally:
         if attached:
             u.AttachThreadInput(mine, target, False)
+        u.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                                ctypes.c_void_p(old.value), SPIF_SENDCHANGE)
+    # GetForegroundWindow can read 0 for a beat mid-switch, so confirm with a few
+    # short retries rather than trusting a single immediate read.
+    target_hwnd = int(hwnd.value)
+    now_fg = 0
+    for _ in range(10):
+        now_fg = int(u.GetForegroundWindow() or 0)
+        if now_fg == target_hwnd:
+            break
+        time.sleep(0.01)
+    success = now_fg == target_hwnd
+    print(f"[hotkey] _force_foreground hwnd={target_hwnd} set_ok={set_ok} "
+          f"attached={attached} now_fg={now_fg} success={success}", flush=True)
+    return success
 
 
 class _Filter(QtCore.QAbstractNativeEventFilter):
@@ -182,21 +226,57 @@ class WinHotkeys:
         self._handlers.clear()
 
 
-def _focus_toggle(ui, find_pid) -> None:
-    u = _user32()
-    overlay_hwnd = int(ui.winId())
-    if int(u.GetForegroundWindow() or 0) == overlay_hwnd:
-        pid = find_pid()                       # overlay is up front -> go back to game
-        gh = find_game_hwnd(pid) if pid else None
-        if gh:
-            _force_foreground(gh)
+def _focus_game(find_pid) -> bool:
+    """Hand foreground focus back to the game window. Returns False if not found.
+
+    This direction holds reliably -- the game is happy to be foreground. The reverse
+    (forcing the overlay foreground over a running game) does NOT hold: the game grabs
+    foreground straight back within a frame, so we never try it. To type, click the
+    chat -- a real click gives lasting focus where a programmatic grab can't."""
+    pid = find_pid()
+    gh = find_game_hwnd(pid) if pid else None
+    if gh:
+        _force_foreground(gh)
+        return True
+    print("[hotkey] focus game: HytaleClient window not found", flush=True)
+    return False
+
+
+def _open_chat(ui) -> None:
+    """Expand the overlay to normal size -- the same path that restores it from the
+    pill. Stays on-top; click it to type."""
+    if getattr(ui, "_collapsed", False):
+        ui.set_collapsed(False)
+
+
+def _close_chat(ui, find_pid) -> None:
+    """Collapse to the pill and hand focus back to the game -- exactly what ESC does."""
+    if not getattr(ui, "_collapsed", False):
+        ui.set_collapsed(True)
+    _focus_game(find_pid)
+
+
+def _size_toggle(ui, find_pid) -> None:
+    """J: one key to open the chat and close it again, built only from behaviours that
+    actually hold -- expand when it's a pill, ESC-style collapse + back-to-game when
+    it's open."""
+    if getattr(ui, "_collapsed", False):
+        print("[hotkey] J -> open chat (expand)", flush=True)
+        _open_chat(ui)
     else:
-        if getattr(ui, "_collapsed", False):
-            ui.set_collapsed(False)            # expand so there's a box to type into
-        _force_foreground(overlay_hwnd)
-        ui.raise_()
-        ui.activateWindow()
-        ui.focus_input()
+        print("[hotkey] J -> close chat (collapse + focus game)", flush=True)
+        _close_chat(ui, find_pid)
+
+
+def _focus_toggle(ui, find_pid) -> None:
+    """O: same reliable primitives, so either key gets you there -- open the chat when
+    it's a pill, hand focus back to the game when it's already open (without resizing)."""
+    if getattr(ui, "_collapsed", False):
+        print("[hotkey] O -> open chat (expand)", flush=True)
+        _open_chat(ui)
+    else:
+        print("[hotkey] O -> focus game", flush=True)
+        _focus_game(find_pid)
 
 
 def setup(app, ui, find_pid, size_spec="win+shift+j",
@@ -204,8 +284,12 @@ def setup(app, ui, find_pid, size_spec="win+shift+j",
     """Register both global hotkeys and wire them to the overlay. Returns a WinHotkeys
     (call .unregister_all() on shutdown). Reports results to stdout and via notify()."""
     hk = WinHotkeys(app, ui.winId(), notify=notify)
-    ok_size = hk.register(size_spec, ui.toggle_collapsed)
+    ok_size = hk.register(size_spec, lambda: _size_toggle(ui, find_pid))
     ok_focus = hk.register(focus_spec, lambda: _focus_toggle(ui, find_pid))
+    # ESC collapses the overlay to a pill; without this it keeps OS focus and the game
+    # stays unresponsive until you click it. Hand focus straight back to the game.
+    if hasattr(ui, "escape_to_game"):
+        ui.escape_to_game.connect(lambda: _focus_game(find_pid))
     if notify:
         good = [s for s, ok in ((size_spec, ok_size), (focus_spec, ok_focus)) if ok]
         bad = [s for s, ok in ((size_spec, ok_size), (focus_spec, ok_focus)) if not ok]
