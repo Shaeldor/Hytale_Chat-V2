@@ -70,10 +70,10 @@ def main() -> int:
     ap.add_argument("--font-size", type=int, default=14,
                     help="overlay chat font size in px (default 14; adjust live in the "
                          "overlay with Ctrl++ / Ctrl+- / Ctrl+0)")
-    ap.add_argument("--hotkey-size", default="win+shift+j",
+    ap.add_argument("--hotkey-size", default="win+shift+o",
                     help="Windows global hotkey to grow/shrink the overlay "
                          "(default: win+shift+j)")
-    ap.add_argument("--hotkey-focus", default="win+shift+o",
+    ap.add_argument("--hotkey-focus", default="win+shift+j",
                     help="Windows global hotkey to toggle focus between the overlay and "
                          "the game (default: win+shift+o; note win+shift+p is taken by "
                          "Windows)")
