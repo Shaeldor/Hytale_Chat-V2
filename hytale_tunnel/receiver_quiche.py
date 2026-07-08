@@ -24,7 +24,7 @@ _CAPTURE = os.path.join(os.path.dirname(__file__), "quiche_capture.py")
 
 # Which classified kinds count as "a player said something" (everything else is
 # server/console noise that floods the chat -- filtered unless show_system=True).
-_PLAYER_KINDS = {"public", "whisper_in", "whisper_out", "emote"}
+_PLAYER_KINDS = {"public", "party", "whisper_in", "whisper_out", "emote"}
 
 
 def _elevate_cmd() -> list[str]:
@@ -41,8 +41,28 @@ def _elevate_cmd() -> list[str]:
     return [py, _CAPTURE, me]
 
 
+def _rescue_party(cl: chatframe.ChatLine, keyed) -> chatframe.ChatLine:
+    """Rescue an encrypted party/chat line we didn't classify as a player line.
+
+    Party-chat formats can vary, so a genuine encrypted party message may land as an
+    unclassified 'system' line and get dropped. If such a line carries a token that
+    decrypts with one of our keys (self-authenticating proof it's real and for us),
+    re-tag it as a 'party' message with a best-effort sender so it still surfaces.
+    Returns the (possibly re-tagged) ChatLine unchanged when no rescue applies.
+    """
+    if cl.kind in _PLAYER_KINDS:
+        return cl
+    m = chatframe.HX_TOKEN_RE.search(cl.full)
+    if not m or crypto.try_decrypt_sym(m.group(0)[3:], keyed) is None:
+        return cl
+    cl.kind = "party"
+    cl.sender = chatframe.sender_before_token(cl.full, m.start())
+    cl.body = m.group(0)          # _build_msg will locate + decrypt this token
+    return cl
+
+
 def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
-               reasm: crypto.Reassembler) -> chatframe.Msg | None:
+               reasm: crypto.Reassembler, keyed) -> chatframe.Msg | None:
     """Turn a parsed line into a display Msg, decrypting an embedded token if any.
 
     Returns None when the line is one chunk of a not-yet-complete tunnel message.
@@ -60,15 +80,18 @@ def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
 
     token = m.group(0)
     marker, body64 = token[:3], token[3:]
-    dec = crypto.try_decrypt_sym(body64, crypto.loaded_psks())
+    dec = crypto.try_decrypt_sym(body64, keyed)
     if dec is None:
         # A real encrypted message, but not addressed to us (someone else's key /
         # no key). In a full mirror we still show the line; we just can't read it.
         return chatframe.Msg(sender=sender, body=cl.body, kind=cl.kind,
                              is_self=is_self, is_tunnel=False, target=cl.target, **colors)
     key_name, payload = dec
-    # Reassemble chunks keyed on the friend's key (each friend = a distinct key).
-    out = reasm.add_decrypted(key_name, marker, payload)
+    # Reassemble chunks keyed on the actual sender from the frame -- for a party group
+    # everyone shares ONE key, so keying on key_name would mix concurrent senders'
+    # chunks; the frame sender (or key_name for whispers) keeps them separate.
+    reasm_id = cl.sender or cl.target or key_name
+    out = reasm.add_decrypted(reasm_id, marker, payload)
     if out is None:                             # a chunk; wait for the rest
         return None
     # The decrypted body is our own plaintext, not a game-rendered run -> no game
@@ -134,11 +157,15 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 # "name: " colon present, but no d2 signature) to learn the alt format.
                 if nsig == 0 and b"\x07#" in raw and b": " in raw:
                     _log("MISSHEX", raw.hex())
+            keyed = crypto.all_decrypt_keys()      # friend + party keys (re-read each buffer)
             for cl in lines:
+                # Rescue an encrypted party message hiding in an unclassified line before
+                # the system-drop filter can discard it.
+                cl = _rescue_party(cl, keyed)
                 if cl.kind not in _PLAYER_KINDS and not show_system:
                     _log("DROP-system", cl.kind, repr(cl.full[:80]))
                     continue
-                msg = _build_msg(cl, my_name, reasm)
+                msg = _build_msg(cl, my_name, reasm, keyed)
                 if msg is None:
                     _log("HOLD-chunk", cl.kind, repr(cl.body[:40]))
                     continue

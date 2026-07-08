@@ -21,6 +21,10 @@ CONFIG_DIR = Path.home() / ".hytalecrypt"
 MY_PRIV_PATH = CONFIG_DIR / "mykey.pem"
 MY_PUB_PATH = CONFIG_DIR / "mykey.pub"
 FRIENDS_DIR = CONFIG_DIR / "friends"
+# Party/group keys live here. Unlike per-friend keys (one shared secret per pair), a
+# group key is one secret shared by EVERY member of a party so a single '/p' ciphertext
+# decrypts for all of them. Same 32-byte AES-256-GCM format as a friend key.
+GROUPS_DIR = CONFIG_DIR / "groups"
 
 # RSA-2048 ciphertext is exactly 256 bytes -> base64 is exactly 344 chars.
 CIPHERTEXT_LEN = 256
@@ -36,6 +40,7 @@ _OAEP = padding.OAEP(
 def ensure_dirs() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     FRIENDS_DIR.mkdir(parents=True, exist_ok=True)
+    GROUPS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_privkey(path: Path = MY_PRIV_PATH) -> RSAPrivateKey:
@@ -195,13 +200,81 @@ def key_fingerprint(raw: bytes) -> str:
     return ":".join(f"{b:02x}" for b in digest)
 
 
-def max_sym_plaintext(name: str) -> int:
-    """Largest message (bytes) whose '/msg <name> <token>' line fits CHAT_LIMIT."""
-    prefix = len(f"/msg {name} ")
-    token_budget = CHAT_LIMIT - prefix
+# --------------------------------------------------------------------------- groups
+# A party/group key is the same 32-byte AES key as a friend key, but stored in
+# GROUPS_DIR and shared by EVERY member of the party (so one '/p' ciphertext decrypts
+# for all of them). Attribution of who sent a group message comes from the chat frame
+# (the sender's name), not from the key -- everyone in the party holds the same key.
+
+def _group_path(name: str) -> Path:
+    return GROUPS_DIR / f"{name}.key"
+
+
+def set_group_psk(name: str, b64key: str) -> Path:
+    """Store a party group key. Raises ValueError if it isn't 32 bytes."""
+    raw = base64.b64decode(b64key.strip())
+    if len(raw) != KEY_LEN:
+        raise ValueError(f"key must be {KEY_LEN} bytes ({KEY_LEN*8}-bit), got {len(raw)}")
+    ensure_dirs()
+    p = _group_path(name)
+    p.write_text(base64.b64encode(raw).decode())
+    p.chmod(0o600)
+    return p
+
+
+def load_group_psk(name: str) -> bytes | None:
+    p = _group_path(name)
+    if not p.exists():
+        return None
+    try:
+        raw = base64.b64decode(p.read_text().strip())
+        return raw if len(raw) == KEY_LEN else None
+    except Exception:
+        return None
+
+
+def list_groups() -> list[str]:
+    if not GROUPS_DIR.exists():
+        return []
+    return sorted(p.stem for p in GROUPS_DIR.glob("*.key"))
+
+
+def loaded_group_psks() -> list[tuple[str, bytes]]:
+    """All (group_name, key) pairs we hold party keys for."""
+    out = []
+    for name in list_groups():
+        k = load_group_psk(name)
+        if k is not None:
+            out.append((name, k))
+    return out
+
+
+def all_decrypt_keys() -> list[tuple[str, bytes]]:
+    """Every shared key we can decrypt an incoming token with: per-friend keys first,
+    then party group keys. AES-GCM authentication means only the right key validates,
+    so trying all of them can't mis-attribute (a wrong key just fails)."""
+    return loaded_psks() + loaded_group_psks()
+
+
+PARTY_PREFIX = "/p chat "     # the in-game party-chat command we type before a token
+
+
+def _budget_for_prefix(prefix_len: int) -> int:
+    """Largest plaintext (bytes) whose '<prefix><token>' line fits CHAT_LIMIT."""
+    token_budget = CHAT_LIMIT - prefix_len
     b64_budget = token_budget - len(SYM_MARKER)
     payload_bytes = (b64_budget // 4) * 3            # base64 expands 3->4
     return max(0, payload_bytes - NONCE_LEN - _TAG_LEN)
+
+
+def max_sym_plaintext(name: str) -> int:
+    """Largest message (bytes) whose '/msg <name> <token>' line fits CHAT_LIMIT."""
+    return _budget_for_prefix(len(f"/msg {name} "))
+
+
+def max_party_plaintext() -> int:
+    """Largest message (bytes) whose '/p <token>' party line fits CHAT_LIMIT."""
+    return _budget_for_prefix(len(PARTY_PREFIX))
 
 
 def encrypt_sym(name: str, message: str) -> str:
@@ -244,7 +317,7 @@ def try_decrypt_sym(token_b64: str | bytes,
         except UnicodeDecodeError:
             return None
     if keyed is None:
-        keyed = loaded_psks()
+        keyed = all_decrypt_keys()
     for name, key in keyed:
         pt = _decrypt_sym_one(token_b64, key)
         if pt is not None:
@@ -272,18 +345,19 @@ def _split_utf8(text: str, max_bytes: int) -> list[str]:
     return out
 
 
-def encrypt_messages(name: str, message: str) -> list[str]:
-    """Return one or more ready-to-send tokens for `message`.
+def _encrypt_messages_core(key: bytes, budget: int, message: str) -> list[str]:
+    """Encrypt `message` under `key` into one or more tokens that each fit `budget`.
 
-    A short message is a single 'HX1...' token (unchanged). A long one is split
-    into 'HX2...' chunk tokens that the receiver reassembles into one message.
+    A message that fits is a single 'HX1...' token; a longer one is split into 'HX2...'
+    chunk tokens the receiver reassembles. `budget` is the max plaintext bytes per token
+    (depends on the send prefix: '/msg <name> ' for whispers, '/p ' for party).
     """
-    if len(message.encode("utf-8")) <= max_sym_plaintext(name):
-        return [encrypt_sym(name, message)]
-    key = load_psk(name)
-    if key is None:
-        raise KeyError(f"No shared key for '{name}'. Run: hytalecrypt setkey {name} <key>")
-    chunk_max = max(1, max_sym_plaintext(name) - _CHUNK_HEADER)
+    data = message.encode("utf-8")
+    if len(data) <= budget:
+        nonce = os.urandom(NONCE_LEN)
+        ct = AESGCM(key).encrypt(nonce, data, None)
+        return [SYM_MARKER + base64.b64encode(nonce + ct).decode()]
+    chunk_max = max(1, budget - _CHUNK_HEADER)
     chunks = _split_utf8(message, chunk_max)
     if len(chunks) > 255:
         raise ValueError("message too long even when chunked")
@@ -296,6 +370,28 @@ def encrypt_messages(name: str, message: str) -> list[str]:
         ct = AESGCM(key).encrypt(nonce, payload, None)
         tokens.append(CHUNK_MARKER + base64.b64encode(nonce + ct).decode())
     return tokens
+
+
+def encrypt_messages(name: str, message: str) -> list[str]:
+    """Return one or more ready-to-send '/msg <name>' tokens for `message`.
+
+    A short message is a single 'HX1...' token; a long one is split into 'HX2...'
+    chunk tokens that the receiver reassembles into one message.
+    """
+    key = load_psk(name)
+    if key is None:
+        raise KeyError(f"No shared key for '{name}'. Run: hytalecrypt setkey {name} <key>")
+    return _encrypt_messages_core(key, max_sym_plaintext(name), message)
+
+
+def encrypt_group_messages(group: str, message: str) -> list[str]:
+    """Return one or more ready-to-send '/p' party tokens for `message`, encrypted with
+    the shared party group key (so every member of the party can decrypt it)."""
+    key = load_group_psk(group)
+    if key is None:
+        raise KeyError(f"No party key for '{group}'. "
+                       f"Run: hytalecrypt setgroupkey {group} <key>")
+    return _encrypt_messages_core(key, max_party_plaintext(), message)
 
 
 class Reassembler:
