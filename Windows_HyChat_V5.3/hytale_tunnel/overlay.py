@@ -78,10 +78,23 @@ class Overlay(QtWidgets.QWidget):
         items += [f for f in friends if f.lower() != "party"]
         
         self.recipient_box.addItems(items)
-        if recipient in items:
+        
+        last_chan = None
+        try:
+            from . import crypto
+            last_chan = (crypto.CONFIG_DIR / "last_channel.txt").read_text().strip()
+        except OSError:
+            pass
+
+        if last_chan in items:
+            self.recipient_box.setCurrentText(last_chan)
+            self.recipient = last_chan
+        elif recipient in items:
             self.recipient_box.setCurrentText(recipient)
         else:
             self.recipient_box.setCurrentText("Public")
+            self.recipient = "Public"
+            
         self.recipient_box.currentTextChanged.connect(self._set_recipient)
         self.recipient_box.setStyleSheet("color:#ddd; background:#222;")
         header.addWidget(self.recipient_box)
@@ -115,14 +128,13 @@ class Overlay(QtWidgets.QWidget):
         body.addWidget(self.view, 1)
         self.input = QtWidgets.QLineEdit()
         self.input.setPlaceholderText(
-            "Type a message to the selected channel... (Esc to collapse)")
+            "Type message... (Sh+Up chat | Sh+Left exit | Sh+Down shrink)")
         self.input.returnPressed.connect(self._on_submit)
         body.addWidget(self.input)
         root.addWidget(self.body, 1)
 
         self._apply_styles()
 
-        QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self._on_escape)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl++"), self,
                         activated=lambda: self.set_font_size(self._font_size + 1))
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+="), self,
@@ -229,6 +241,8 @@ class Overlay(QtWidgets.QWidget):
         self.body.setVisible(not collapsed)
         self.arrow.setVisible(not collapsed)
         self.recipient_box.setVisible(not collapsed)
+        self.btn_encrypt.setVisible(not collapsed)
+        self.btn_decrypt.setVisible(not collapsed)
         if collapsed:
             self.title.setText("🔒 ▸")
             self.title.setStyleSheet(self._PILL_STYLE)
@@ -303,6 +317,12 @@ class Overlay(QtWidgets.QWidget):
 
     def _set_recipient(self, name: str) -> None:
         self.recipient = name
+        try:
+            from . import crypto
+            crypto.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            (crypto.CONFIG_DIR / "last_channel.txt").write_text(name)
+        except OSError:
+            pass
 
     def _append_html(self, line: str) -> None:
         self.view.append(line)

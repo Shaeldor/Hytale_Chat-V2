@@ -93,13 +93,12 @@ def main() -> int:
     ap.add_argument("--font-size", type=int, default=14,
                     help="overlay chat font size in px (default 14; adjust live in the "
                          "overlay with Ctrl++ / Ctrl+- / Ctrl+0)")
-    ap.add_argument("--hotkey-size", default="win+shift+o",
-                    help="Windows global hotkey to grow/shrink the overlay "
-                         "(default: win+shift+j)")
-    ap.add_argument("--hotkey-focus", default="win+shift+j",
-                    help="Windows global hotkey to toggle focus between the overlay and "
-                         "the game (default: win+shift+o; note win+shift+p is taken by "
-                         "Windows)")
+    ap.add_argument("--hotkey-open", default="shift+up",
+                    help="Windows global hotkey to open the chat (default: shift+up)")
+    ap.add_argument("--hotkey-close", default="shift+down",
+                    help="Windows global hotkey to close the chat (default: shift+down)")
+    ap.add_argument("--hotkey-unfocus", default="shift+left",
+                    help="Windows global hotkey to unfocus the chat but leave it expanded (default: shift+left)")
     ap.add_argument("--mark-seen", action="store_true",
                     help="record all messages currently in memory as seen, then exit "
                          "(open the in-game chat first to bake in the backlog)")
@@ -349,7 +348,8 @@ def main() -> int:
             from . import hotkeys_win
             hotkeys = hotkeys_win.setup(
                 app, ui, memscan.find_client_pid,
-                size_spec=args.hotkey_size, focus_spec=args.hotkey_focus,
+                open_spec=args.hotkey_open, close_spec=args.hotkey_close,
+                unfocus_spec=args.hotkey_unfocus,
                 notify=lambda m: inbox.put((SYS, m)))
         except Exception as e:
             inbox.put((SYS, f"global hotkeys unavailable: {e}"))

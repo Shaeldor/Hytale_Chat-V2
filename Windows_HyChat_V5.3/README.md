@@ -33,5 +33,10 @@ Once you have a key, everyone needs to register it. In that same `cmd` window:
 4. Type your message and hit Enter!
 
 ## 💡 Cool Features
+- **Global Hotkeys**: Control the chat without taking your hands off the keyboard!
+  - `Shift + Up Arrow`: Instantly opens the chat box so you can start typing.
+  - `Shift + Down Arrow`: Shrinks the chat box down to a tiny pill icon.
+  - `Shift + Left Arrow`: Returns focus to the game, but keeps the chat fully expanded on your screen so you can read while you play!
+- **Channel Memory**: The chat overlay automatically remembers the last channel you selected. If you close it on "Party", it will open back up on "Party"!
 - **Custom Encrypt (🔐)**: Click the lock icon next to the dropdown to instantly encrypt a message and copy it to your clipboard. You can paste this on signs, in books, or anywhere in the world!
 - **Manual Decrypt (👁️)**: See a weird `HX1...` code on a sign? Copy it, click the eye icon, paste it in, and the tunnel will decode the hidden message for you!

@@ -31,6 +31,24 @@ SPIF_SENDCHANGE = 0x0002
 _MODS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
          "shift": MOD_SHIFT, "win": MOD_WIN, "super": MOD_WIN, "meta": MOD_WIN}
 
+_SPECIAL_VK = {
+    "\\": 0xDC,  # VK_OEM_5
+    "`": 0xC0,
+    "-": 0xBD,
+    "=": 0xBB,
+    "[": 0xDB,
+    "]": 0xDD,
+    ";": 0xBA,
+    "'": 0xDE,
+    ",": 0xBC,
+    ".": 0xBE,
+    "/": 0xBF,
+    "up": 0x26,
+    "down": 0x28,
+    "left": 0x25,
+    "right": 0x27,
+}
+
 
 def parse_hotkey(spec: str):
     """'win+shift+j' -> (modifiers|MOD_NOREPEAT, vk). Single letter/digit key only."""
@@ -40,6 +58,8 @@ def parse_hotkey(spec: str):
             continue
         if part in _MODS:
             mods |= _MODS[part]
+        elif part in _SPECIAL_VK:
+            vk = _SPECIAL_VK[part]
         elif len(part) == 1:
             vk = ord(part.upper())          # VK codes for 0-9 / A-Z are their ASCII values
         else:
@@ -247,6 +267,13 @@ def _open_chat(ui) -> None:
     pill. Stays on-top; click it to type."""
     if getattr(ui, "_collapsed", False):
         ui.set_collapsed(False)
+    
+    # We must explicitly force the OS to give us foreground, as Windows prevents
+    # background windows from stealing focus from the active game.
+    _force_foreground(int(ui.winId()))
+    ui.raise_()
+    ui.activateWindow()
+    ui.input.setFocus()
 
 
 def _close_chat(ui, find_pid) -> None:
@@ -256,46 +283,29 @@ def _close_chat(ui, find_pid) -> None:
     _focus_game(find_pid)
 
 
-def _size_toggle(ui, find_pid) -> None:
-    """J: one key to open the chat and close it again, built only from behaviours that
-    actually hold -- expand when it's a pill, ESC-style collapse + back-to-game when
-    it's open."""
-    if getattr(ui, "_collapsed", False):
-        print("[hotkey] J -> open chat (expand)", flush=True)
-        _open_chat(ui)
-    else:
-        print("[hotkey] J -> close chat (collapse + focus game)", flush=True)
-        _close_chat(ui, find_pid)
+def _unfocus_chat(ui, find_pid) -> None:
+    """Hand focus back to the game without collapsing the overlay."""
+    print("[hotkey] -> unfocus chat (focus game)", flush=True)
+    _focus_game(find_pid)
 
 
-def _focus_toggle(ui, find_pid) -> None:
-    """O: same reliable primitives, so either key gets you there -- open the chat when
-    it's a pill, hand focus back to the game when it's already open (without resizing)."""
-    if getattr(ui, "_collapsed", False):
-        print("[hotkey] O -> open chat (expand)", flush=True)
-        _open_chat(ui)
-    else:
-        print("[hotkey] O -> focus game", flush=True)
-        _focus_game(find_pid)
-
-
-def setup(app, ui, find_pid, size_spec="win+shift+j",
-          focus_spec="win+shift+o", notify=None):
+def setup(app, ui, find_pid, open_spec="shift+up", close_spec="shift+down", unfocus_spec="shift+left", notify=None):
     """Register both global hotkeys and wire them to the overlay. Returns a WinHotkeys
     (call .unregister_all() on shutdown). Reports results to stdout and via notify()."""
     hk = WinHotkeys(app, ui.winId(), notify=notify)
-    ok_size = hk.register(size_spec, lambda: _size_toggle(ui, find_pid))
-    ok_focus = hk.register(focus_spec, lambda: _focus_toggle(ui, find_pid))
+    ok_open = hk.register(open_spec, lambda: _open_chat(ui))
+    ok_close = hk.register(close_spec, lambda: _close_chat(ui, find_pid))
+    ok_unfocus = hk.register(unfocus_spec, lambda: _unfocus_chat(ui, find_pid))
     # ESC collapses the overlay to a pill; without this it keeps OS focus and the game
     # stays unresponsive until you click it. Hand focus straight back to the game.
     if hasattr(ui, "escape_to_game"):
         ui.escape_to_game.connect(lambda: _focus_game(find_pid))
     if notify:
-        good = [s for s, ok in ((size_spec, ok_size), (focus_spec, ok_focus)) if ok]
-        bad = [s for s, ok in ((size_spec, ok_size), (focus_spec, ok_focus)) if not ok]
+        good = [s for s, ok in ((open_spec, ok_open), (close_spec, ok_close), (unfocus_spec, ok_unfocus)) if ok]
+        bad = [s for s, ok in ((open_spec, ok_open), (close_spec, ok_close), (unfocus_spec, ok_unfocus)) if not ok]
         if good:
             notify("hotkeys ready: " + ", ".join(good))
         if bad:
             notify("hotkey(s) already in use: " + ", ".join(bad)
-                   + " — set others with --hotkey-size / --hotkey-focus")
+                   + " — set others with --hotkey-* args")
     return hk
