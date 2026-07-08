@@ -194,6 +194,20 @@ def _paste(method: str):
            _ki(vk=key, flags=KEYEVENTF_KEYUP), _ki(vk=mod, flags=KEYEVENTF_KEYUP)])
 
 
+def _send_line(line: str, open_key: str, type_delay_ms: int, paste_method: str) -> None:
+    use_paste = paste_method in ("ctrl-v", "shift-insert")
+    if use_paste and _set_clipboard(line):
+        _open_chat(open_key)
+        time.sleep(T_OPEN_WAIT)
+        _paste(paste_method)
+    else:
+        _open_chat(open_key)
+        time.sleep(T_OPEN_WAIT)
+        _type_text(line, type_delay_ms)
+    time.sleep(T_AFTER_INPUT)
+    _press_vk(VK_RETURN)
+
+
 def send_message(friend: str, message: str, open_key: str = "Return",
                  settle: float = 0.3, type_delay_ms: int = 12, pre_send=None,
                  paste_method: str = "type") -> list[str]:
@@ -204,23 +218,23 @@ def send_message(friend: str, message: str, open_key: str = "Return",
     `pre_send(token)` is called for each token before it is sent.
     """
     tokens = crypto.encrypt_messages(friend, message)
-    use_paste = paste_method in ("ctrl-v", "shift-insert")
     focus_game()
     time.sleep(T_SETTLE)
     for idx, tok in enumerate(tokens):
         if pre_send:
             pre_send(tok)
-        line = f"/msg {friend} {tok}"
-        if use_paste and _set_clipboard(line):
-            _open_chat(open_key)
-            time.sleep(T_OPEN_WAIT)
-            _paste(paste_method)
-        else:
-            _open_chat(open_key)
-            time.sleep(T_OPEN_WAIT)
-            _type_text(line, type_delay_ms)
-        time.sleep(T_AFTER_INPUT)
-        _press_vk(VK_RETURN)
+        _send_line(f"/msg {friend} {tok}", open_key, type_delay_ms, paste_method)
         if idx < len(tokens) - 1:
             time.sleep(T_CHUNK_GAP)
     return tokens
+
+
+def send_public(message: str, open_key: str = "Return", type_delay_ms: int = 12,
+                paste_method: str = "type") -> str:
+    """Type `message` into the in-game chat as a normal (unencrypted) public line --
+    no /msg prefix, no crypto. Used for plain compose-box input (anything that
+    isn't a /msg <name> or /r whisper)."""
+    focus_game()
+    time.sleep(T_SETTLE)
+    _send_line(message, open_key, type_delay_ms, paste_method)
+    return message
