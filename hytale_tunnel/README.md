@@ -125,32 +125,23 @@ MinHook/Detours) — not built yet.
 
 ### Setup
 
-1. Install Python 3 from **python.org** (tick **Add python.exe to PATH** — this also
-   installs the `py` launcher the tools prefer). Avoid the Microsoft Store "python":
-   it leaves a stub `python.exe` that just opens the Store. If you already have it,
-   the bundled launchers look past the stub and find a real Python automatically.
-2. Copy the whole share folder (the `hytale_tunnel` package, the `hytalecrypt`
-   script, and `setup-windows.bat`) somewhere, e.g. `C:\hytale\`.
-3. Double-click **`setup-windows.bat`** once — it installs `pyqt6` + `cryptography`.
-4. Exchange a shared key over Discord and both run
-   `py C:\hytale\hytalecrypt setkey <theirname> <key>` (or `python …`).
-5. Start the overlay by double-clicking **`hytale_tunnel\hytale-tunnel.bat`**
-   (pass `-r <friend>` to pick the recipient), or from a terminal:
-   `cd C:\hytale && py -m hytale_tunnel -r <friend>`.
-
-> **Borderless/windowed only:** the always-on-top overlay can't draw over a game in
-> *exclusive* fullscreen. Set Hytale to **borderless windowed** so the pill stays
-> visible (same as any Discord/Steam overlay).
+1. Install Python 3 (python.org, tick **Add to PATH**), then
+   `pip install pyqt6 cryptography`.
+2. Copy the whole `hytale_tunnel` folder and the `hytalecrypt` script (e.g. to
+   `C:\hytale\`, with the package at `C:\hytale\hytale_tunnel\`).
+3. Exchange a shared key over Discord and both run
+   `python C:\hytale\hytalecrypt setkey <theirname> <key>`.
+4. Run from the folder that contains the package:
+   `cd C:\hytale && python -m hytale_tunnel -r <friend>`
+   (or double-click `hytale_tunnel\hytale-tunnel.bat`).
 
 **Sending**: `SendInput` is real input on Windows, so `--paste-method ctrl-v`
 (default) should paste instantly. If it doesn't land, use `--paste-method type`.
 **Reading memory**: if `OpenProcess` fails, run the terminal **as Administrator**.
 Anti-cheat is more likely to notice memory reads/synthetic input on Windows.
 
-> Status: the Windows backend has now been run end-to-end on a real Windows 11 +
-> Hytale client — process discovery, the writable-region walk, `ReadProcessMemory`,
-> the UTF-16 token scan + AES-GCM decrypt, window focus, and `SendInput` typing/paste
-> were all verified live (a `/msg self` round-trip was decrypted back out of memory).
+> Note: the Windows backend is written to the Win32 API spec with size-verified
+> struct layouts, but was authored on Linux and not yet run on a real Windows client.
 
 Windows first-run self-test (no second player): `python hytalecrypt setkey self <key>`,
 `python hytalecrypt senc self "memtest123"`, paste the printed `/msg self HX1…` line

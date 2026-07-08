@@ -66,18 +66,6 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
 
 def _kernel32():
     k = ctypes.WinDLL("kernel32", use_last_error=True)
-    # Handles are pointer-sized; without explicit restype/argtypes ctypes defaults to
-    # c_int (32-bit), which truncates/sign-extends a real kernel HANDLE on 64-bit
-    # Windows. The snapshot handle happened to be small in one test, but a larger
-    # value would silently corrupt the process walk -- declare them all.
-    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    k.Process32First.restype = wintypes.BOOL
-    k.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
-    k.Process32Next.restype = wintypes.BOOL
-    k.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
-    k.CloseHandle.restype = wintypes.BOOL
-    k.CloseHandle.argtypes = [wintypes.HANDLE]
     k.OpenProcess.restype = wintypes.HANDLE
     k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k.ReadProcessMemory.restype = wintypes.BOOL
