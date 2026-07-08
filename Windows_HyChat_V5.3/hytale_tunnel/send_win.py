@@ -7,6 +7,7 @@ windll is touched only inside functions so this imports on non-Windows too; memi
 sibling dispatcher (send.py) only selects it on win32.
 """
 
+import contextlib
 import ctypes
 import subprocess
 import time
@@ -50,7 +51,6 @@ class KEYBDINPUT(ctypes.Structure):
 class _INPUTUNION(ctypes.Union):
     _fields_ = [("ki", KEYBDINPUT), ("_pad", ctypes.c_byte * 32)]
 
-
 class INPUT(ctypes.Structure):
     _fields_ = [("type", _DWORD), ("u", _INPUTUNION)]
 
@@ -61,8 +61,6 @@ def _user32():
     u.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
     u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    # HWND is pointer-sized; without argtypes ctypes truncates it to 32 bits on
-    # 64-bit Windows, so focus/show act on a garbage window. Declare them all.
     u.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
     u.EnumWindows.restype = wintypes.BOOL
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -77,13 +75,29 @@ def _user32():
     u.AttachThreadInput.restype = wintypes.BOOL
     u.IsIconic.argtypes = [wintypes.HWND]
     u.IsIconic.restype = wintypes.BOOL
+    u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    u.GetAsyncKeyState.restype = wintypes.SHORT
     return u
 
-
-# WINFUNCTYPE is Windows-only; fall back so this module still imports off-Windows
-# (it is only ever *called* on win32, via the send.py dispatcher).
 _FUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 _WNDENUMPROC = _FUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+class AbortSendException(Exception):
+    pass
+
+def _sleep(seconds: float):
+    u = _user32()
+    end = time.time() + seconds
+    while time.time() < end:
+        # Check A-Z (excluding V = 0x56)
+        for vk in range(0x41, 0x5A + 1):
+            if vk != 0x56 and (u.GetAsyncKeyState(vk) & 0x8000):
+                raise AbortSendException(f"Aborted: Detected physical key press.")
+        # Check 0-9
+        for vk in range(0x30, 0x39 + 1):
+            if u.GetAsyncKeyState(vk) & 0x8000:
+                raise AbortSendException(f"Aborted: Detected physical key press.")
+        time.sleep(0.01)
 
 
 def find_game_window():
@@ -161,7 +175,7 @@ def _type_text(text: str, delay_ms: int = 8):
         _send([_ki(scan=code, flags=KEYEVENTF_UNICODE),
                _ki(scan=code, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)])
         if delay_ms:
-            time.sleep(delay_ms / 1000)
+            _sleep(delay_ms / 1000)
 
 
 def _press_vk(vk: int):
@@ -210,7 +224,7 @@ def _set_clipboard(text: str) -> bool:
     for _ in range(5):
         if u.OpenClipboard(None):
             break
-        time.sleep(0.05)
+        _sleep(0.05)
     else:
         return False
         
@@ -246,19 +260,19 @@ def _paste(method: str):
 def _send_line(line: str, open_key: str, type_delay_ms: int, paste_method: str, use_paste: bool):
     if use_paste and _set_clipboard(line):
         _open_chat(open_key)
-        time.sleep(T_OPEN_WAIT)
+        _sleep(T_OPEN_WAIT)
         _paste(paste_method)
     else:
         _open_chat(open_key)
-        time.sleep(T_OPEN_WAIT)
+        _sleep(T_OPEN_WAIT)
         _type_text(line, type_delay_ms)
-    time.sleep(T_AFTER_INPUT)
+    _sleep(T_AFTER_INPUT)
     _press_vk(VK_RETURN)
 
 
 def send_message(friend: str, message: str, open_key: str = "Return",
                  settle: float = 0.3, type_delay_ms: int = 12, pre_send=None,
-                 paste_method: str = "type") -> list[str]:
+                 paste_method: str = "ctrl-v") -> list[str]:
     """Encrypt `message` for `friend` and send it in-game as one or more /msg lines.
 
     Long messages are split into encrypted chunks (the receiver reassembles them).
@@ -268,41 +282,41 @@ def send_message(friend: str, message: str, open_key: str = "Return",
     tokens = crypto.encrypt_messages(friend, message)
     use_paste = paste_method in ("ctrl-v", "shift-insert")
     focus_game()
-    time.sleep(T_SETTLE)
+    _sleep(T_SETTLE)
     for idx, tok in enumerate(tokens):
         if pre_send:
             pre_send(tok)
         line = f"/msg {friend} {tok}"
         _send_line(line, open_key, type_delay_ms, paste_method, use_paste)
         if idx < len(tokens) - 1:
-            time.sleep(T_CHUNK_GAP)
+            _sleep(T_CHUNK_GAP)
     return tokens
 
 
 def send_public(message: str, open_key: str = "Return", type_delay_ms: int = 12,
-                paste_method: str = "type") -> str:
+                paste_method: str = "ctrl-v") -> str:
     """Type `message` into the in-game chat as a normal (unencrypted) public line --
     no /msg prefix, no crypto. Used for plain compose-box input (anything that
     isn't a /msg <name> or /r whisper)."""
     use_paste = paste_method in ("ctrl-v", "shift-insert")
     focus_game()
-    time.sleep(T_SETTLE)
+    _sleep(T_SETTLE)
     _send_line(message, open_key, type_delay_ms, paste_method, use_paste)
     return message
 
 
 def send_party_message(message: str, open_key: str = "Return",
                        settle: float = 0.3, type_delay_ms: int = 12, pre_send=None,
-                       paste_method: str = "type") -> list[str]:
+                       paste_method: str = "ctrl-v") -> list[str]:
     tokens = crypto.encrypt_messages("party", message)
     use_paste = paste_method in ("ctrl-v", "shift-insert")
     focus_game()
-    time.sleep(T_SETTLE)
+    _sleep(T_SETTLE)
     for idx, tok in enumerate(tokens):
         if pre_send:
             pre_send(tok)
         line = f"/party chat {tok}"
         _send_line(line, open_key, type_delay_ms, paste_method, use_paste)
         if idx < len(tokens) - 1:
-            time.sleep(T_CHUNK_GAP)
+            _sleep(T_CHUNK_GAP)
     return tokens

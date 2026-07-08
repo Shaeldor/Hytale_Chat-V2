@@ -26,3 +26,13 @@ Hey! We need to upgrade this Linux version of Hytale Tunnel with some new UI fea
    - In `Overlay.__init__`, store the list of friends as `self._friends_list`.
    - In `add_message`, completely override the game's default name colors. If `msg.is_self`, make the name green. If `msg.sender in self._friends_list`, make the name cyan blue. Otherwise (strangers), make it white.
    - For `msg.kind == "party"`, format the line so the `[Party] ` tag is always orange, but the player's name still follows the Green/Cyan/White rule above.
+6. **Custom Encrypt/Decrypt Buttons (`overlay.py` & `app.py`)**:
+   - In `overlay.py`, add a `btn_encrypt` and `btn_decrypt` button to the header next to the dropdown. Give them signals (`custom_encrypt_requested` and `custom_decrypt_requested`) that trigger input dialog boxes.
+   - Ensure these buttons are hidden during `set_collapsed(True)` so the pill can shrink correctly.
+   - In `app.py`, wire these signals up. The encrypt slot should encrypt the user's input with the selected channel's key and place the tokens on the user's system clipboard. The decrypt slot should take a token, decrypt it, and print the output as a system message.
+
+7. **Hotkeys & Channel Memory (`app.py`, `hotkeys_linux.py`, `overlay.py`)**:
+   - Add arguments in `app.py` for `--hotkey-open` (`shift+up`), `--hotkey-close` (`shift+down`), and `--hotkey-unfocus` (`shift+left`). Wire them to the Linux hotkey manager.
+   - Remove the `Esc` QShortcut from `overlay.py`.
+   - Change the input placeholder to `(Shift+Up chat | Shift+Down shrink | Shift+Left exit)`.
+   - In `overlay.py`, read/write `last_channel.txt` in the `.hytalecrypt` directory. Read it during `__init__` to set the default dropdown selection, and write it inside `_set_recipient()` whenever the dropdown changes.
