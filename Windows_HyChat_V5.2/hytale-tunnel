@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Launcher for the Hytale encrypted-chat overlay.
+# Puts ~/.local/lib on PYTHONPATH so the hytale_tunnel package is importable.
+exec python3 -c 'import sys; sys.path.insert(0, __import__("os").path.expanduser("~/.local/lib")); from hytale_tunnel.app import main; raise SystemExit(main())' "$@"

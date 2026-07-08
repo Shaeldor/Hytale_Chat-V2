@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Diagnostic: find a given chat token in the live HytaleClient memory and report
+HOW it is stored (encoding) and WHERE (region size). Run right after receiving a
+message so it is still resident:
+
+    hytale-finddiag "HX1....the blob from chat...."
+
+Helps figure out why some message types (e.g. private whispers) aren't captured.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+from hytale_tunnel import memio, crypto  # noqa: E402
+
+if len(sys.argv) < 2:
+    sys.exit("usage: hytale-finddiag <HX1-blob-or-token>")
+
+blob = sys.argv[1].strip()
+if blob.startswith("/msg"):
+    blob = blob.split()[-1]
+frag = blob[:24]                      # search a fragment (robust to trailing chars)
+
+encodings = {
+    "ascii/utf-8":  frag.encode("utf-8"),
+    "utf-16-le":    frag.encode("utf-16-le"),
+    "utf-16-be":    frag.encode("utf-16-be"),
+    "utf-32-le":    frag.encode("utf-32-le"),
+}
+
+pid = memio.find_client_pid()
+if pid is None:
+    sys.exit("HytaleClient not running")
+print(f"scanning pid {pid} for fragment {frag!r} ...")
+
+found = {k: [] for k in encodings}
+with memio.open_reader(pid) as r:
+    for s, e in r.regions():
+        addr = s
+        chunk = b""
+        while addr < e:
+            buf = r.read(addr, min(8 * 1024 * 1024, e - addr))
+            if not buf:
+                break
+            window = chunk[-64:] + buf
+            for name, needle in encodings.items():
+                if needle in window:
+                    found[name].append((s, e))
+            chunk = buf
+            addr += len(buf)
+
+print("\nRESULTS:")
+for name, regions in found.items():
+    if regions:
+        regions = list(dict.fromkeys(regions))
+        szs = ", ".join(f"{(e-s)/1e6:.1f}MB" for s, e in regions[:5])
+        print(f"  ✅ {name:12}: {len(regions)} region(s)  sizes: {szs}")
+    else:
+        print(f"  ❌ {name:12}: not found")
+
+if not any(found.values()):
+    print("\n  Not found in any encoding — it already evicted from memory, "
+          "or is stored compressed/elsewhere. Try again faster after receiving it.")
+# show the decrypted text so the user can confirm it's the right message
+body = blob[len(crypto.SYM_MARKER):] if blob.startswith(crypto.SYM_MARKER) else blob
+res = crypto.try_decrypt_sym(body)
+print(f"\n  (decrypts to: {res})")
