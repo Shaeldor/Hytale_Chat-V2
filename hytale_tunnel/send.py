@@ -5,14 +5,14 @@ from here."""
 import sys
 
 if sys.platform.startswith("win"):
-    from .send_win import find_game_window, focus_game, send_message
+    from .send_win import find_game_window, focus_game, send_message, send_public
 elif sys.platform.startswith("linux"):
-    from .send_linux import find_game_window, focus_game, send_message
+    from .send_linux import find_game_window, focus_game, send_message, send_public
 else:                                                       # pragma: no cover
     def _unsupported(*a, **k):
         raise RuntimeError(f"sending unsupported on platform: {sys.platform}")
 
-    find_game_window = focus_game = send_message = _unsupported
+    find_game_window = focus_game = send_message = send_public = _unsupported
 
 
 if __name__ == "__main__":
