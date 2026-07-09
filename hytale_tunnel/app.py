@@ -250,21 +250,36 @@ def main() -> int:
     # Global collapse/expand toggle from anywhere (even when the game is focused):
     # a Hyprland keybind sends SIGUSR1 to this process. The flag is consumed by the
     # drain timer so the toggle happens on the Qt main thread.
-    toggle = {"pending": False, "quit": False, "font": 0}
+    toggle = {"pending": False, "quit": False, "font": 0, "open": False}
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, lambda *_: toggle.__setitem__("pending", True))
     # Global font resize (SUPER+SHIFT+± via Hyprland -> real-time signals). RT signals
     # queue in the kernel, so rapid presses accumulate instead of being coalesced; the
     # handler just tallies the net delta, applied on the Qt thread by the drain timer.
+    # SIGRTMIN+3 = "open & focus the chat" (the '\' quick-open bind).
     if hasattr(signal, "SIGRTMIN"):
         signal.signal(signal.SIGRTMIN + 1, lambda *_: toggle.__setitem__("font", toggle["font"] + 1))
         signal.signal(signal.SIGRTMIN + 2, lambda *_: toggle.__setitem__("font", toggle["font"] - 1))
+        signal.signal(signal.SIGRTMIN + 3, lambda *_: toggle.__setitem__("open", True))
     # Graceful shutdown so the `finally` block runs and removes the PID file
     # (SIGTERM/SIGINT would otherwise kill us without cleanup, leaving a stale pid).
     for _signame in ("SIGTERM", "SIGINT"):
         if hasattr(signal, _signame):
             signal.signal(getattr(signal, _signame),
                           lambda *_: toggle.__setitem__("quit", True))
+
+    def _focus_window(cls: str) -> None:
+        """Give Hyprland keyboard focus to a window by class (Wayland won't let a client
+        focus itself, so ask the compositor — same mechanism as the SUPER+SHIFT+P bind)."""
+        if LINUX:
+            subprocess.run(["hyprctl", "dispatch", "focuswindow", f"class:^({cls})$"],
+                           capture_output=True)
+
+    def _focus_overlay() -> None:
+        _focus_window("hytale-tunnel")
+        ui.raise_()
+        ui.activateWindow()
+        ui.input.setFocus()
 
     def drain() -> None:
         if toggle["quit"]:
@@ -274,6 +289,10 @@ def main() -> int:
         if toggle["pending"]:
             toggle["pending"] = False
             ui.toggle_collapsed()
+        if toggle["open"]:                   # '\' quick-open: expand (if collapsed) + focus
+            toggle["open"] = False
+            ui.set_collapsed(False)
+            QtCore.QTimer.singleShot(120, _focus_overlay)
         if toggle["font"]:
             delta, toggle["font"] = toggle["font"], 0
             ui.bump_font(delta)
@@ -386,7 +405,17 @@ def main() -> int:
     def reposition() -> None:
         for delay in (120, 400, 750):
             QtCore.QTimer.singleShot(delay, lambda: _position_top_right(ui, app, saved_pos))
-    ui.collapsed_changed.connect(reposition)
+
+    def _on_collapsed_changed() -> None:
+        reposition()
+        if ui._collapsed:
+            # collapsed back to the pill -> hand keyboard focus back to the game
+            QtCore.QTimer.singleShot(120, lambda: _focus_window("HytaleClient"))
+        else:
+            # enlarged -> focus the compose bar so you can type right away
+            # (same effect as SUPER+SHIFT+P), which Qt alone can't do on Wayland
+            QtCore.QTimer.singleShot(180, _focus_overlay)
+    ui.collapsed_changed.connect(_on_collapsed_changed)
 
     # Persist layout so the overlay reopens exactly where it was left. Geometry is read
     # from Hyprland (Wayland hides the frame position from Qt); font/recipient come from
