@@ -14,7 +14,7 @@ import threading
 
 from PyQt6 import QtCore, QtWidgets
 
-from . import chatframe, crypto, memscan, playername, send
+from . import chatframe, crypto, inject_client, memscan, playername, send
 from .chatframe import Msg
 from .overlay import Overlay
 
@@ -151,6 +151,11 @@ def main() -> int:
     ap.add_argument("--type-delay", type=int, default=8,
                     help="ms between keystrokes when typing (lower = faster; raise if "
                          "characters get dropped). default 8")
+    ap.add_argument("--send-method", choices=["type", "inject"], default="inject",
+                    help="how to send: 'inject' (default) pushes the message straight onto the "
+                         "game's QUIC stream via ptrace injection -- instant, no chatbox "
+                         "(Linux, needs root/pkexec; the injector launches on your first send); "
+                         "'type' types into the in-game chatbox instead")
     ap.add_argument("--interval", type=float, default=0.2, help="fast poll seconds")
     ap.add_argument("--sweep", type=float, default=3.0,
                     help="seconds between full discovery sweeps (lower = catch messages "
@@ -217,6 +222,25 @@ def main() -> int:
     # Who /r replies to: last friend we privately messaged, or who last privately
     # messaged us (whichever happened most recently).
     last_contact = {"name": None}
+
+    # Send by injecting straight onto the game's QUIC stream (ptrace) instead of typing
+    # into the chatbox. The elevated (pkexec) injector is launched LAZILY on the first send
+    # -- NOT at startup -- so its pkexec prompt doesn't collide with the receiver's (two
+    # simultaneous pkexec prompts at launch made the receiver silently fail to start).
+    _inject = {"proc": None}
+    _inject_lock = threading.Lock()
+
+    def get_injector():
+        if args.send_method != "inject" or not LINUX:
+            return None
+        with _inject_lock:
+            if _inject["proc"] is None:
+                inbox.put((SYS, "starting injector (approve the pkexec prompt)…"))
+                inj = inject_client.Injector(os.getpid())
+                proc_holder.append(inj.proc)
+                _inject["proc"] = inj
+            return _inject["proc"]
+
     if LINUX:
         # Full mirror: capture every chat-log line at quiche's decrypt boundary (eBPF),
         # in the server's canonical order, with the real sender from the frame.
@@ -343,9 +367,13 @@ def main() -> int:
 
             def _do_send() -> None:
                 try:
-                    send.send_message(friend, body, open_key=args.open_key,
-                                      pre_send=_ledger, paste_method=args.paste_method,
-                                      type_delay_ms=args.type_delay)
+                    inj = get_injector()
+                    if inj is not None:
+                        inj.send("private", friend, body)
+                    else:
+                        send.send_message(friend, body, open_key=args.open_key,
+                                          pre_send=_ledger, paste_method=args.paste_method,
+                                          type_delay_ms=args.type_delay)
                 except Exception as e:               # noqa: BLE001 - surface to overlay
                     inbox.put((SYS, f"send failed: {e}"))
         elif mode == "party":                        # encrypted party (shared group key)
@@ -361,9 +389,13 @@ def main() -> int:
 
             def _do_send() -> None:
                 try:
-                    send.send_party(group, body, open_key=args.open_key,
-                                    pre_send=_ledger, paste_method=args.paste_method,
-                                    type_delay_ms=args.type_delay)
+                    inj = get_injector()
+                    if inj is not None:
+                        inj.send("party", group, body)
+                    else:
+                        send.send_party(group, body, open_key=args.open_key,
+                                        pre_send=_ledger, paste_method=args.paste_method,
+                                        type_delay_ms=args.type_delay)
                 except Exception as e:               # noqa: BLE001 - surface to overlay
                     inbox.put((SYS, f"send failed: {e}"))
         else:  # public -- plain in-game chat, unencrypted
@@ -374,9 +406,13 @@ def main() -> int:
 
             def _do_send() -> None:
                 try:
-                    send.send_public(body, open_key=args.open_key,
-                                     paste_method=args.paste_method,
-                                     type_delay_ms=args.type_delay)
+                    inj = get_injector()
+                    if inj is not None:
+                        inj.send("public", None, body)
+                    else:
+                        send.send_public(body, open_key=args.open_key,
+                                         paste_method=args.paste_method,
+                                         type_delay_ms=args.type_delay)
                 except Exception as e:               # noqa: BLE001 - surface to overlay
                     inbox.put((SYS, f"send failed: {e}"))
         threading.Thread(target=_do_send, daemon=True).start()
