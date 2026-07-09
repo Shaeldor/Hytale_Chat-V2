@@ -15,7 +15,9 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 CONFIG_DIR = Path.home() / ".hytalecrypt"
 MY_PRIV_PATH = CONFIG_DIR / "mykey.pem"
@@ -198,6 +200,150 @@ def loaded_psks() -> list[tuple[str, bytes]]:
 def key_fingerprint(raw: bytes) -> str:
     digest = hashlib.sha256(raw).digest()[:8]
     return ":".join(f"{b:02x}" for b in digest)
+
+
+# --------------------------------------------------------------------------- /friend
+# X25519 key-agreement handshake, carried over the public /msg channel.
+#
+# Each user has ONE long-term X25519 keypair. To befriend someone we exchange public
+# keys (via /msg); both sides then compute the SAME shared secret with X25519 ECDH --
+# an eavesdropper who logs both /msg lines sees only two public keys and CANNOT derive
+# the secret. The shared secret is HKDF-stretched into the 32-byte AES-256 key the
+# normal HX1/HX2 message crypto already uses, so no other code path changes.
+#
+# Trust-on-first-use: there is no PKI, so an ACTIVE man-in-the-middle who swaps the
+# keys mid-handshake is not detected automatically. Both sides are shown the resulting
+# key fingerprint so they can compare it out-of-band (voice/Discord) if they want that
+# guarantee. Passive eavesdropping (the stated threat) is fully prevented.
+#
+# Wire tokens (plaintext, fit easily in one /msg):
+#   "HXK1 <b64(my 32-byte X25519 pubkey)>"  -- /friend add   (request)
+#   "HXK2 <b64(my 32-byte X25519 pubkey)>"  -- /friend accept (reply)
+X25519_PRIV_PATH = CONFIG_DIR / "x25519.key"
+PENDING_DIR = CONFIG_DIR / "pending"       # inbound requests + outbound-add markers
+HS_ADD = "HXK1"                            # request token marker
+HS_ACCEPT = "HXK2"                         # reply token marker
+_HS_INFO = b"hytale-tunnel friend v1"      # HKDF context (identical on both sides)
+
+
+def load_or_create_x25519() -> X25519PrivateKey:
+    """Our long-term X25519 private key (generated once, then reused)."""
+    ensure_dirs()
+    if X25519_PRIV_PATH.exists():
+        return serialization.load_pem_private_key(
+            X25519_PRIV_PATH.read_bytes(), password=None, backend=default_backend())
+    priv = X25519PrivateKey.generate()
+    X25519_PRIV_PATH.write_bytes(priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()))
+    X25519_PRIV_PATH.chmod(0o600)
+    return priv
+
+
+def my_hs_pub_b64() -> str:
+    """Our X25519 public key, base64 — the payload of an HXK1/HXK2 token."""
+    raw = load_or_create_x25519().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    return base64.b64encode(raw).decode()
+
+
+def hs_add_token() -> str:
+    return f"{HS_ADD} {my_hs_pub_b64()}"
+
+
+def hs_accept_token() -> str:
+    return f"{HS_ACCEPT} {my_hs_pub_b64()}"
+
+
+def parse_hs_token(body: str) -> tuple[str, str] | None:
+    """If `body` is a handshake line, return (marker, their_pub_b64), else None."""
+    parts = body.strip().split()
+    if len(parts) == 2 and parts[0] in (HS_ADD, HS_ACCEPT):
+        try:
+            if len(base64.b64decode(parts[1], validate=True)) == 32:
+                return parts[0], parts[1]
+        except Exception:                        # noqa: BLE001
+            return None
+    return None
+
+
+def derive_friend_key(their_pub_b64: str) -> bytes:
+    """The shared AES-256 key from our private key and their X25519 public key.
+    Symmetric: both friends compute the identical key."""
+    their_pub = X25519PublicKey.from_public_bytes(base64.b64decode(their_pub_b64))
+    shared = load_or_create_x25519().exchange(their_pub)
+    return HKDF(algorithm=hashes.SHA256(), length=KEY_LEN,
+                salt=None, info=_HS_INFO, backend=default_backend()).derive(shared)
+
+
+def save_derived_friend_key(name: str, their_pub_b64: str) -> bytes:
+    """Derive and persist the shared key for `name`; returns the raw key."""
+    key = derive_friend_key(their_pub_b64)
+    set_psk(name, base64.b64encode(key).decode())
+    return key
+
+
+def _pending_in_path(name: str) -> Path:
+    return PENDING_DIR / f"{name}.in"
+
+
+def _pending_out_path(name: str) -> Path:
+    return PENDING_DIR / f"{name}.out"
+
+
+def record_incoming_request(name: str, their_pub_b64: str) -> None:
+    """Stash an inbound /friend add's pubkey until we run /friend accept <name>."""
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    _pending_in_path(name).write_text(their_pub_b64)
+
+
+def take_incoming_request(name: str) -> str | None:
+    """Pop the stored inbound pubkey for `name` (consumed on accept)."""
+    p = _pending_in_path(name)
+    if not p.exists():
+        return None
+    b64 = p.read_text().strip()
+    p.unlink()
+    return b64
+
+
+def peek_incoming_request(name: str) -> str | None:
+    p = _pending_in_path(name)
+    return p.read_text().strip() if p.exists() else None
+
+
+def list_incoming_requests() -> list[str]:
+    if not PENDING_DIR.exists():
+        return []
+    return sorted(p.stem for p in PENDING_DIR.glob("*.in"))
+
+
+def record_outgoing_request(name: str) -> None:
+    """Mark that WE sent an add to `name`, so their HXK2 reply is expected (not spoofed)."""
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    _pending_out_path(name).write_text("1")
+
+
+def has_outgoing_request(name: str) -> bool:
+    return _pending_out_path(name).exists()
+
+
+def clear_outgoing_request(name: str) -> None:
+    p = _pending_out_path(name)
+    if p.exists():
+        p.unlink()
+
+
+def remove_friend(name: str) -> bool:
+    """Delete every trace of a friend (shared key, RSA pubkey, pending markers)."""
+    removed = False
+    for p in (_psk_path(name), FRIENDS_DIR / f"{name}.pub",
+              _pending_in_path(name), _pending_out_path(name)):
+        if p.exists():
+            p.unlink()
+            removed = True
+    return removed
 
 
 # --------------------------------------------------------------------------- groups

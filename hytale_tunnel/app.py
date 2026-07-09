@@ -70,11 +70,10 @@ def _parse_command(text: str, last_contact: dict):
         parts = text[len("/msg "):].split(None, 1)
         if len(parts) < 2:
             return "error", None, "usage: /msg <name> <message>"
-        name = parts[0]
-        if name not in crypto.list_psk_friends():
-            known = ", ".join(crypto.list_psk_friends()) or "(none)"
-            return "error", None, f"unknown friend '{name}'. Known: {known}"
-        return "private", name, parts[1]
+        name, msg = parts[0], parts[1]
+        if name in crypto.list_psk_friends():
+            return "private", name, msg                # have a key -> encrypted
+        return "public", None, f"/msg {name} {msg}"    # no key -> plain /msg, as-is
     if text == "/p" or text.startswith("/p "):
         body = text[len("/p"):].strip()
         if not body:
@@ -87,9 +86,12 @@ def _parse_command(text: str, last_contact: dict):
         body = text[len("/r"):].strip()
         if not body:
             return "error", None, "usage: /r <message>"
-        if not last_contact["name"]:
+        name = last_contact["name"]
+        if not name:
             return "error", None, "no one to reply to yet"
-        return "private", last_contact["name"], body
+        if name in crypto.list_psk_friends():
+            return "private", name, body               # have a key -> encrypted
+        return "public", None, f"/msg {name} {body}"   # no key -> plain /msg, as-is
     return "public", None, text
 
 
@@ -209,6 +211,7 @@ def main() -> int:
     QtWidgets.QApplication.setDesktopFileName("hytale-tunnel")
     app = QtWidgets.QApplication(sys.argv)
     ui = Overlay(recipient, friends, font_px=saved_font, size=saved_size)
+    ui.refresh_friends(friends, crypto.list_incoming_requests())   # surface leftover requests
 
     my_name = playername.detect(args.me)
 
@@ -299,11 +302,148 @@ def main() -> int:
             subprocess.run(["hyprctl", "dispatch", "focuswindow", f"class:^({cls})$"],
                            capture_output=True)
 
+    # --- Enter-hotkey (dynamic Hyprland bind) ---
+    # Enter focuses the compose bar, but ONLY when the tunnel is EXPANDED and the GAME is
+    # focused. When the tunnel itself has focus, Enter must submit (bind removed); in pill
+    # mode it's off entirely. A permanently-global Enter bind would hijack Enter everywhere
+    # and make submitting impossible, so we add/remove it via hyprctl as state changes.
+    _bind_state = {"on": None}
+
+    def _game_focused() -> bool:
+        if not LINUX:
+            return False
+        try:
+            aw = json.loads(subprocess.run(["hyprctl", "-j", "activewindow"],
+                                           capture_output=True, text=True).stdout or "{}")
+            return aw.get("class") == "HytaleClient"
+        except Exception:                            # noqa: BLE001
+            return False
+
+    def _set_enter_bind(on: bool) -> None:
+        if not LINUX or _bind_state["on"] is on:
+            return
+        _bind_state["on"] = on
+        if on:
+            cmd = f"/usr/bin/kill --signal RTMIN+3 {os.getpid()} 2>/dev/null"
+            subprocess.run(["hyprctl", "keyword", "bind", f", Return, exec, {cmd}"],
+                           capture_output=True)
+        else:
+            subprocess.run(["hyprctl", "keyword", "unbind", ", Return"], capture_output=True)
+
+    def _update_enter_bind() -> None:
+        # Enter hotkey ON only while the tunnel is EXPANDED and the GAME is the focused
+        # window -> so Enter focuses the compose bar while gaming, but never hijacks Enter
+        # in the tunnel itself (submit) or in other apps (terminal, browser).
+        _set_enter_bind((not ui._collapsed) and _game_focused())
+
+    # While the tunnel is focused, turn OFF Hyprland's follow-mouse so the cursor can move
+    # into the chat (to click/select) without the game stealing focus back. Restore the
+    # user's original setting when the tunnel isn't focused.
+    _mouse = {"free": None, "orig": None}
+
+    def _set_free_mouse(free: bool) -> None:
+        if not LINUX or _mouse["free"] is free:
+            return
+        if _mouse["orig"] is None:
+            try:
+                out = subprocess.run(["hyprctl", "getoption", "input:follow_mouse"],
+                                     capture_output=True, text=True).stdout
+                _mouse["orig"] = next((int(w.split()[1]) for w in out.splitlines()
+                                       if w.strip().startswith("int:")), 1)
+            except Exception:                        # noqa: BLE001
+                _mouse["orig"] = 1
+        _mouse["free"] = free
+        val = 0 if free else _mouse["orig"]
+        subprocess.run(["hyprctl", "keyword", "input:follow_mouse", str(val)],
+                       capture_output=True)
+
     def _focus_overlay() -> None:
         _focus_window("hytale-tunnel")
         ui.raise_()
         ui.activateWindow()
         ui.input.setFocus()
+        _set_enter_bind(False)                       # tunnel now focused -> Enter must submit
+        _set_free_mouse(True)                        # cursor can roam the chat freely
+
+    def _focus_game() -> None:
+        _focus_window("HytaleClient")
+        _set_free_mouse(False)
+        QtCore.QTimer.singleShot(60, _update_enter_bind)   # let focus settle, then re-arm
+
+    def _on_activation(active: bool) -> None:
+        _set_free_mouse(active)
+        _update_enter_bind()
+        ui.set_opened(active)                         # focused => full history; else => fading HUD
+    ui.activation_changed.connect(_on_activation)
+
+    # --- /friend: X25519 key-agreement handshake over the public /msg channel ---
+    def _send_line(line: str) -> None:
+        """Send one raw chat line via the public path (inject or type), off the Qt thread."""
+        def _do() -> None:
+            try:
+                inj = get_injector()
+                if inj is not None:
+                    inj.send("public", None, line)
+                else:
+                    send.send_public(line, open_key=args.open_key,
+                                     paste_method=args.paste_method, type_delay_ms=args.type_delay)
+            except Exception as e:                   # noqa: BLE001
+                inbox.put((SYS, f"send failed: {e}"))
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _do_friend(text: str) -> None:
+        parts = text.split(None, 2)                  # ['/friend', 'add', 'Bob']
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        name = parts[2].strip() if len(parts) > 2 else ""
+        if sub not in ("add", "accept", "remove") or not name:
+            inbox.put((SYS, "usage: /friend add|accept|remove <player>"))
+            return
+        if sub == "add":
+            crypto.record_outgoing_request(name)
+            _send_line(f"/msg {name} {crypto.hs_add_token()}")
+            inbox.put((SYS, f"friend request sent to {name} — have them run: "
+                            f"/friend accept {my_name or 'you'}"))
+        elif sub == "accept":
+            pub = crypto.take_incoming_request(name)
+            if pub is None:
+                inbox.put((SYS, f"no pending friend request from {name}"))
+                return
+            key = crypto.save_derived_friend_key(name, pub)
+            _send_line(f"/msg {name} {crypto.hs_accept_token()}")
+            inbox.put((SYS, f"now friends with {name} · key {crypto.key_fingerprint(key)} "
+                            f"(verify it matches theirs)"))
+        else:                                        # remove
+            msg = (f"removed friend {name}" if crypto.remove_friend(name)
+                   else f"no such friend: {name}")
+            inbox.put((SYS, msg))
+        ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+
+    def _maybe_handshake(msg) -> bool:
+        """If `msg` is an X25519 handshake line, process it and return True (swallow it)."""
+        if msg.kind not in ("whisper_in", "whisper_out"):
+            return False
+        parsed = crypto.parse_hs_token(msg.body)
+        if not parsed:
+            return False
+        if msg.is_self:
+            return True                              # our own HXK echo -> don't display it
+        marker, their_pub = parsed
+        name = msg.sender
+        if marker == crypto.HS_ADD:
+            crypto.record_incoming_request(name, their_pub)
+            inbox.put((SYS, f"{name} wants to be friends — run: /friend accept {name}"))
+        elif not crypto.has_outgoing_request(name):
+            inbox.put((SYS, f"ignored unexpected friend-accept from {name}"))
+            return True
+        else:                                        # HS_ACCEPT to an add we sent
+            key = crypto.save_derived_friend_key(name, their_pub)
+            crypto.clear_outgoing_request(name)
+            inbox.put((SYS, f"{name} accepted — now friends · key {crypto.key_fingerprint(key)} "
+                            f"(verify it matches theirs)"))
+        ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+        return True
+
+    ui.friend_action.connect(lambda action, nm: _do_friend(f"/friend {action} {nm}"))
 
     def drain() -> None:
         if toggle["quit"]:
@@ -313,7 +453,7 @@ def main() -> int:
         if toggle["pending"]:
             toggle["pending"] = False
             ui.toggle_collapsed()
-        if toggle["open"]:                   # '\' quick-open: expand (if collapsed) + focus
+        if toggle["open"]:                   # Enter hotkey: focus the compose bar (expand first)
             toggle["open"] = False
             ui.set_collapsed(False)
             QtCore.QTimer.singleShot(120, _focus_overlay)
@@ -325,6 +465,8 @@ def main() -> int:
                 tag, payload = inbox.get_nowait()
                 if tag is SYS:
                     ui.add_system(payload)
+                elif _maybe_handshake(payload):
+                    continue                     # /friend handshake -> consumed, not shown
                 else:
                     ui.add_message(payload)
                     if payload.kind == "whisper_in" and not payload.is_self:
@@ -339,6 +481,11 @@ def main() -> int:
     def on_submit(text: str) -> None:
         text = text.strip()
         if not text:
+            return
+        if text.split(None, 1)[0].lower() == "/friend":
+            _do_friend(text)
+            if LINUX:
+                QtCore.QTimer.singleShot(60, _focus_game)
             return
         mode, friend, body = _parse_command(text, last_contact)
         if mode == "error":
@@ -416,8 +563,16 @@ def main() -> int:
                 except Exception as e:               # noqa: BLE001 - surface to overlay
                     inbox.put((SYS, f"send failed: {e}"))
         threading.Thread(target=_do_send, daemon=True).start()
+        # After sending, hand keyboard focus back to the game (so you can keep playing;
+        # this also re-arms the Enter hotkey since the overlay is no longer focused).
+        if LINUX:
+            QtCore.QTimer.singleShot(60, _focus_game)
 
     ui.submitted.connect(on_submit)
+    # Empty Enter in the compose box = "dismiss": hand focus back to the game (which also
+    # re-arms the Enter hotkey), so a second Enter toggles the chat closed like SUPER+SHIFT+P.
+    if LINUX:
+        ui.dismissed.connect(lambda: QtCore.QTimer.singleShot(0, _focus_game))
 
     if memscan.find_client_pid() is None:
         ui.add_system("HytaleClient not running — waiting…")
@@ -444,12 +599,14 @@ def main() -> int:
 
     def _on_collapsed_changed() -> None:
         reposition()
+        _update_enter_bind()                     # pill => Enter hotkey off; expanded => depends
         if ui._collapsed:
-            # collapsed back to the pill -> hand keyboard focus back to the game
-            QtCore.QTimer.singleShot(120, lambda: _focus_window("HytaleClient"))
+            # collapsed back to the pill -> just drop the tunnel's focus; do NOT force the
+            # game to the front (that yanks you back after switching desktops / minimizing).
+            ui.clearFocus()
+            _set_free_mouse(False)                # restore normal follow-mouse
         else:
             # enlarged -> focus the compose bar so you can type right away
-            # (same effect as SUPER+SHIFT+P), which Qt alone can't do on Wayland
             QtCore.QTimer.singleShot(180, _focus_overlay)
     ui.collapsed_changed.connect(_on_collapsed_changed)
 
@@ -486,10 +643,21 @@ def main() -> int:
     scanner.start()
     ui.show()
     reposition()
+
+    # Arm the Enter hotkey from whoever is actually focused right now, and re-check every
+    # second so a direct game->other-app switch (no overlay focus event) can't leave Enter
+    # hijacked in that app.
+    QtCore.QTimer.singleShot(600, _update_enter_bind)
+    enter_timer = QtCore.QTimer()
+    enter_timer.timeout.connect(_update_enter_bind)
+    enter_timer.start(1000)
+
     try:
         return app.exec()
     finally:
         persist()                            # capture wherever it was left
+        _set_enter_bind(False)               # never leave Enter hijacked after we exit
+        _set_free_mouse(False)               # restore the user's follow-mouse setting
         stop.set()
         for p in proc_holder:                # stop the elevated capture process
             try:
