@@ -56,4 +56,4 @@ Once you have a key, everyone who wants to communicate needs to register it. In 
    - **Public**: Sends normal, unencrypted messages.
    - **Party**: Encrypts the message so only people with your "party" key can read it.
    - **[Friend Name]**: Encrypts the message so only that specific friend can read it.
-4. Type your message and hit Enter!
+4. Type your message and hit Enter! Happy tunneling! 🚀
