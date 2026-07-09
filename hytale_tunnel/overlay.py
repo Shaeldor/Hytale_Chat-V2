@@ -21,7 +21,7 @@ FONT_SIZE_PX = int(os.environ.get("HYTALE_TUNNEL_FONT_SIZE", "14"))
 # Transcript background opacity (0 = fully transparent "just text", 255 = solid). Kept
 # low so the overlay is mostly see-through; text itself stays fully opaque. The compose
 # box uses a bit more so it's easy to find. Tune with HYTALE_TUNNEL_BG_ALPHA.
-BG_ALPHA = max(0, min(255, int(os.environ.get("HYTALE_TUNNEL_BG_ALPHA", "45"))))
+BG_ALPHA = max(0, min(255, int(os.environ.get("HYTALE_TUNNEL_BG_ALPHA", "12"))))
 
 # Rank/name/body colours come straight off the wire -- tuned for the game's own UI,
 # not our translucent near-black overlay (rgba ~10,12,16). A dark red (or any dark
@@ -83,9 +83,9 @@ class Overlay(QtWidgets.QWidget):
         self.filter_btn.setToolTip("filter shown messages (click to cycle)")
         self.filter_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.filter_btn.setStyleSheet(
-            "QPushButton{color:#ddd; background:rgba(34,34,34,110);"
-            "border:1px solid rgba(58,65,80,140); border-radius:4px; padding:2px 8px;}"
-            " QPushButton:hover{background:rgba(44,49,60,160);}")
+            "QPushButton{color:#ddd; background:rgba(34,34,34,40);"
+            "border:1px solid rgba(58,65,80,70); border-radius:4px; padding:2px 8px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
         self.filter_btn.clicked.connect(self._cycle_filter)
         self._update_filter_btn()
         header.addWidget(self.filter_btn)
@@ -94,9 +94,9 @@ class Overlay(QtWidgets.QWidget):
         self.emoji_btn.setToolTip("insert emoji (or type :shortcodes: like :fire:)")
         self.emoji_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.emoji_btn.setStyleSheet(
-            "QPushButton{background:rgba(34,34,34,110);"
-            "border:1px solid rgba(58,65,80,140); border-radius:4px; padding:2px 6px;}"
-            " QPushButton:hover{background:rgba(44,49,60,160);}")
+            "QPushButton{background:rgba(34,34,34,40);"
+            "border:1px solid rgba(58,65,80,70); border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
         self.emoji_btn.clicked.connect(self._open_emoji_picker)
         self._picker = None
         header.addWidget(self.emoji_btn)
@@ -108,7 +108,7 @@ class Overlay(QtWidgets.QWidget):
         if recipient in friends:
             self.recipient_box.setCurrentText(recipient)
         self.recipient_box.currentTextChanged.connect(self._set_recipient)
-        self.recipient_box.setStyleSheet("color:#ddd; background:rgba(34,34,34,120);")
+        self.recipient_box.setStyleSheet("color:#ddd; background:rgba(34,34,34,50);")
         header.addWidget(self.recipient_box)
         root.addWidget(self.header)
 
