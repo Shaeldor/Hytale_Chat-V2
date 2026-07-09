@@ -14,7 +14,14 @@ import os
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from . import emoji_util
+
 FONT_SIZE_PX = int(os.environ.get("HYTALE_TUNNEL_FONT_SIZE", "14"))
+
+# Transcript background opacity (0 = fully transparent "just text", 255 = solid). Kept
+# low so the overlay is mostly see-through; text itself stays fully opaque. The compose
+# box uses a bit more so it's easy to find. Tune with HYTALE_TUNNEL_BG_ALPHA.
+BG_ALPHA = max(0, min(255, int(os.environ.get("HYTALE_TUNNEL_BG_ALPHA", "45"))))
 
 # Rank/name/body colours come straight off the wire -- tuned for the game's own UI,
 # not our translucent near-black overlay (rgba ~10,12,16). A dark red (or any dark
@@ -41,12 +48,16 @@ class Overlay(QtWidgets.QWidget):
     submitted = QtCore.pyqtSignal(str)          # emitted with composed plaintext
     collapsed_changed = QtCore.pyqtSignal()     # emitted after collapse/expand (resize)
 
-    def __init__(self, recipient: str, friends: list[str]):
+    def __init__(self, recipient: str, friends: list[str],
+                 font_px: int | None = None, size=None):
         super().__init__()
         self.recipient = recipient
         self._collapsed = False
         self._unread = 0
-        self._expanded_size = QtCore.QSize(440, 320)
+        self._entries = []          # ordered [(kind, payload)] so filters can re-render
+        self._filter_idx = 0
+        self._font_px = font_px or FONT_SIZE_PX
+        self._expanded_size = QtCore.QSize(*size) if size else QtCore.QSize(440, 320)
         self.setWindowTitle("hytale-tunnel")    # Hyprland matches this for window rules
         self.setWindowFlags(
             QtCore.Qt.WindowType.FramelessWindowHint
@@ -67,6 +78,28 @@ class Overlay(QtWidgets.QWidget):
         self.title = QtWidgets.QLabel("🔒 tunnel")
         self.title.setStyleSheet("color:#8fd; font-weight:bold;")
         header.addWidget(self.title)
+        # Filter button: click to cycle which messages the transcript shows.
+        self.filter_btn = QtWidgets.QPushButton()
+        self.filter_btn.setToolTip("filter shown messages (click to cycle)")
+        self.filter_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.filter_btn.setStyleSheet(
+            "QPushButton{color:#ddd; background:rgba(34,34,34,110);"
+            "border:1px solid rgba(58,65,80,140); border-radius:4px; padding:2px 8px;}"
+            " QPushButton:hover{background:rgba(44,49,60,160);}")
+        self.filter_btn.clicked.connect(self._cycle_filter)
+        self._update_filter_btn()
+        header.addWidget(self.filter_btn)
+        # Emoji picker: click to browse/insert a :shortcode: into the compose box.
+        self.emoji_btn = QtWidgets.QPushButton("😀")
+        self.emoji_btn.setToolTip("insert emoji (or type :shortcodes: like :fire:)")
+        self.emoji_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.emoji_btn.setStyleSheet(
+            "QPushButton{background:rgba(34,34,34,110);"
+            "border:1px solid rgba(58,65,80,140); border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,160);}")
+        self.emoji_btn.clicked.connect(self._open_emoji_picker)
+        self._picker = None
+        header.addWidget(self.emoji_btn)
         header.addStretch(1)
         self.arrow = QtWidgets.QLabel("→")
         header.addWidget(self.arrow)
@@ -75,7 +108,7 @@ class Overlay(QtWidgets.QWidget):
         if recipient in friends:
             self.recipient_box.setCurrentText(recipient)
         self.recipient_box.currentTextChanged.connect(self._set_recipient)
-        self.recipient_box.setStyleSheet("color:#ddd; background:#222;")
+        self.recipient_box.setStyleSheet("color:#ddd; background:rgba(34,34,34,120);")
         header.addWidget(self.recipient_box)
         root.addWidget(self.header)
 
@@ -85,25 +118,46 @@ class Overlay(QtWidgets.QWidget):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(6)
         self.view = QtWidgets.QTextEdit(readOnly=True)
-        self.view.setStyleSheet(
-            "QTextEdit{background:rgba(10,12,16,200); color:#e6e6e6;"
-            "border:1px solid #2a2f3a; border-radius:6px; padding:4px;"
-            f"font-family:monospace; font-size:{FONT_SIZE_PX}px;}}"
-        )
         body.addWidget(self.view, 1)
         self.input = QtWidgets.QLineEdit()
         self.input.setPlaceholderText(
-            "message (public) · /msg name msg or /r msg (private) · Esc to collapse")
-        self.input.setStyleSheet(
-            "QLineEdit{background:rgba(20,24,30,230); color:#fff;"
-            "border:1px solid #3a4150; border-radius:6px; padding:5px;"
-            f"font-size:{FONT_SIZE_PX}px;}}"
-        )
+            "public · /msg or /r (private) · /p (party) · :emoji: · 😀 picker · Esc")
         self.input.returnPressed.connect(self._on_submit)
         body.addWidget(self.input)
         root.addWidget(self.body, 1)
+        self._apply_font()                       # size the transcript + input box
 
         QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self._on_escape)
+        # Focused-only fallbacks for font size (the global SUPER+SHIFT+± binds go
+        # through Hyprland -> SIGRTMIN; these work when the overlay itself has focus).
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+="), self, activated=lambda: self.bump_font(1))
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl++"), self, activated=lambda: self.bump_font(1))
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+-"), self, activated=lambda: self.bump_font(-1))
+
+    # ---- font sizing ----
+    _FONT_MIN, _FONT_MAX = 8, 40
+
+    def _apply_font(self) -> None:
+        """(Re)apply the current font size + transparency to the transcript + input."""
+        in_alpha = min(235, BG_ALPHA + 70)      # compose box a touch more visible
+        self.view.setStyleSheet(
+            f"QTextEdit{{background:rgba(10,12,16,{BG_ALPHA}); color:#e6e6e6;"
+            "border:none; border-radius:6px; padding:4px;"
+            f"font-family:monospace; font-size:{self._font_px}px;}}")
+        self.input.setStyleSheet(
+            f"QLineEdit{{background:rgba(20,24,30,{in_alpha}); color:#fff;"
+            "border:1px solid rgba(90,100,120,110); border-radius:6px; padding:5px;"
+            f"font-size:{self._font_px}px;}}")
+
+    def bump_font(self, delta: int) -> None:
+        """Grow/shrink the chat font by `delta` px (clamped). No-op at the limits."""
+        new = max(self._FONT_MIN, min(self._FONT_MAX, self._font_px + delta))
+        if new == self._font_px:
+            return
+        self._font_px = new
+        self._apply_font()
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     # ---- public API (call from the Qt main thread only) ----
 
@@ -112,14 +166,27 @@ class Overlay(QtWidgets.QWidget):
     _C_OTHER = "#c8d0dc"      # another player (soft white)
     _C_TUNNEL = "#7ec8ff"     # encrypted/decrypted tunnel (cyan)
     _C_WHISPER = "#ff8fd0"    # whispers (magenta)
+    _C_PARTY = "#ffd479"      # party chat (amber)
     _C_EMOTE = "#b9a9ff"      # /me emotes (purple)
     _C_DIM = "#7a828f"        # connectives ("whispers:", "to")
     _C_SYS = "#888"           # server/console lines
 
     def add_message(self, msg) -> None:
-        """Render a chatframe.Msg (the unified display message)."""
+        """Store + render a chatframe.Msg, honoring the current display filter."""
+        self._entries.append(("msg", msg))
+        if not self._passes(msg):
+            return
+        self._append_html(self._format_message(msg))
+        if not msg.is_self:
+            self._note_activity()
+
+    def _format_message(self, msg) -> str:
+        """Build the HTML line for a chatframe.Msg (no side effects)."""
         name = html.escape(msg.sender)
-        body = html.escape(msg.body).replace("\n", "<br>")
+        # Expand emoji shortcodes/emoticons BEFORE escaping (glyphs are HTML-safe, and
+        # "<3" must be matched before "<" would become "&lt;"). Display-side only, so the
+        # encrypted wire keeps the compact shortcode.
+        body = html.escape(emoji_util.emojize(msg.body)).replace("\n", "<br>")
         lock = "🔒 " if msg.is_tunnel else ""
         # Mirror the game's own colours where we have them (name / body are each
         # independently coloured runs on the wire); fall back to our fixed palette
@@ -132,7 +199,12 @@ class Overlay(QtWidgets.QWidget):
         if not msg.is_self and msg.body_color and not msg.is_tunnel:
             body = f'<span style="color:{_brighten(msg.body_color)}">{body}</span>'
 
-        if msg.kind == "emote":
+        if msg.kind == "party":
+            who = "you" if msg.is_self else name
+            who_color = self._C_YOU if msg.is_self else self._C_PARTY
+            line = (f'<span style="color:{self._C_PARTY}">{lock}[P] </span>'
+                    f'<span style="color:{who_color}"><b>{html.escape(who)}:</b></span> {body}')
+        elif msg.kind == "emote":
             who = "you" if msg.is_self else name
             line = (f'<span style="color:{self._C_EMOTE}"><i>{lock}* '
                     f'{html.escape(who)} {body}</i></span>')
@@ -148,13 +220,63 @@ class Overlay(QtWidgets.QWidget):
             line = f'<span style="color:{self._C_SYS}">{body}</span>'
         else:  # public
             line = (f'<span style="color:{name_color}">{lock}<b>{name}:</b></span> {body}')
-
-        self._append_html(line)
-        if not msg.is_self:
-            self._note_activity()
+        return line
 
     def add_system(self, text: str) -> None:
-        self._append_html(f'<span style="color:{self._C_SYS}">· {html.escape(text)}</span>')
+        self._entries.append(("sys", text))
+        self._append_html(self._format_system(text))
+
+    def _format_system(self, text: str) -> str:
+        return f'<span style="color:{self._C_SYS}">· {html.escape(text)}</span>'
+
+    # ---- display filter (cycled by the header button) ----
+    # (key, short label). 'all' = everything; 'private' = party + whispers only;
+    # 'tunnel' = only encrypted (decrypted) messages.
+    _FILTERS = (
+        ("all", "all"),
+        ("private", "party+dm"),
+        ("tunnel", "encrypted"),
+    )
+
+    def _passes(self, msg) -> bool:
+        key = self._FILTERS[self._filter_idx][0]
+        if key == "private":
+            return msg.kind in ("party", "whisper_in", "whisper_out")
+        if key == "tunnel":
+            return bool(msg.is_tunnel)
+        return True
+
+    def _cycle_filter(self) -> None:
+        self._filter_idx = (self._filter_idx + 1) % len(self._FILTERS)
+        self._update_filter_btn()
+        self._rebuild()
+
+    def _update_filter_btn(self) -> None:
+        self.filter_btn.setText(self._FILTERS[self._filter_idx][1])
+
+    def _rebuild(self) -> None:
+        """Re-render the whole transcript from stored entries under the current filter.
+        System/status lines always show; chat messages are filtered."""
+        self.view.clear()
+        for kind, payload in self._entries:
+            if kind == "sys":
+                self.view.append(self._format_system(payload))
+            elif self._passes(payload):
+                self.view.append(self._format_message(payload))
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    # ---- emoji picker ----
+
+    def _open_emoji_picker(self) -> None:
+        if self._picker is None:
+            self._picker = EmojiPicker(self, self._insert_shortcode)
+        self._picker.popup(self.emoji_btn)
+
+    def _insert_shortcode(self, ch: str) -> None:
+        """Insert the picked emoji's :shortcode: at the compose-box cursor."""
+        self.input.insert(emoji_util.to_shortcode(ch))
+        self.input.setFocus()
 
     # ---- collapse / expand ----
 
@@ -168,6 +290,8 @@ class Overlay(QtWidgets.QWidget):
         self._collapsed = collapsed
         self.body.setVisible(not collapsed)
         self.arrow.setVisible(not collapsed)
+        self.filter_btn.setVisible(not collapsed)
+        self.emoji_btn.setVisible(not collapsed)
         self.recipient_box.setVisible(not collapsed)
         if collapsed:
             self.title.setText("🔒 ▸")
@@ -220,3 +344,78 @@ class Overlay(QtWidgets.QWidget):
         if text:
             self.input.clear()
             self.submitted.emit(text)
+
+
+class EmojiPicker(QtWidgets.QWidget):
+    """A small popup grid of emoji. Clicking one inserts its :shortcode: via `on_pick`.
+
+    Shows a curated set by default; the search box filters the full emoji database when the
+    `emoji` lib is present. Frameless Qt.Popup so it closes when you click elsewhere.
+    """
+
+    _COLS = 8
+
+    def __init__(self, parent, on_pick):
+        super().__init__(parent, QtCore.Qt.WindowType.Popup)
+        self._on_pick = on_pick
+        self.setStyleSheet("background:rgba(18,21,27,245);"
+                           "border:1px solid #3a4150; border-radius:8px;")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText(
+            "search emoji…" if emoji_util.available() else "type :codes: (emoji lib not installed)")
+        self.search.setStyleSheet(
+            "QLineEdit{background:rgba(10,12,16,220); color:#fff;"
+            "border:1px solid #3a4150; border-radius:6px; padding:4px;}")
+        self.search.textChanged.connect(self._refresh)
+        self.search.setEnabled(emoji_util.available())
+        lay.addWidget(self.search)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self._host = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self._host)
+        self.grid.setSpacing(2)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.scroll.setWidget(self._host)
+        lay.addWidget(self.scroll)
+
+        self.setFixedSize(324, 300)
+        self._refresh()
+
+    def _clear(self) -> None:
+        while self.grid.count():
+            w = self.grid.takeAt(0).widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _refresh(self, *_) -> None:
+        q = self.search.text().strip()
+        chars = emoji_util.search(q) if q else emoji_util.PICKER_EMOJI
+        self._clear()
+        for i, ch in enumerate(chars):
+            b = QtWidgets.QToolButton()
+            b.setText(ch)
+            b.setToolTip(emoji_util.to_shortcode(ch))
+            b.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                "QToolButton{border:none; font-size:20px; padding:3px;}"
+                " QToolButton:hover{background:rgba(60,66,80,180); border-radius:4px;}")
+            b.clicked.connect(lambda _=False, c=ch: self._pick(c))
+            self.grid.addWidget(b, i // self._COLS, i % self._COLS)
+
+    def _pick(self, ch: str) -> None:
+        self._on_pick(ch)
+        self.close()
+
+    def popup(self, anchor) -> None:
+        """Show just below the `anchor` widget."""
+        gp = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + 4))
+        self.move(gp)
+        self.show()
+        self.raise_()
+        self.search.setFocus()

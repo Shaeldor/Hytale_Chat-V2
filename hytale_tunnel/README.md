@@ -126,7 +126,9 @@ MinHook/Detours) — not built yet.
 ### Setup
 
 1. Install Python 3 (python.org, tick **Add to PATH**), then
-   `pip install pyqt6 cryptography`.
+   `pip install pyqt6 cryptography emoji`.
+   (On Linux install the `emoji` package too: `pacman -S python-emoji`, or
+   `pip install --user emoji`. Without it, emoji shortcodes just show as text.)
 2. Copy the whole `hytale_tunnel` folder and the `hytalecrypt` script (e.g. to
    `C:\hytale\`, with the package at `C:\hytale\hytale_tunnel\`).
 3. Exchange a shared key over Discord and both run
