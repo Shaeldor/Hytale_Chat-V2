@@ -361,6 +361,8 @@ def main() -> int:
         _focus_window("hytale-tunnel")
         ui.raise_()
         ui.activateWindow()
+        ui.set_opened(True)                          # show the compose bar first (it's hidden
+                                                     # in passive HUD mode) so setFocus can land
         ui.input.setFocus()
         _set_enter_bind(False)                       # tunnel now focused -> Enter must submit
         _set_free_mouse(True)                        # cursor can roam the chat freely
