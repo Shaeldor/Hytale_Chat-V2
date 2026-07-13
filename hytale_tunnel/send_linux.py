@@ -203,11 +203,16 @@ def send_public(message: str, open_key: str = "Return", type_delay_ms: int = 12,
                 paste_method: str = "type") -> str:
     """Type `message` into the in-game chat as a normal (unencrypted) public line --
     no /msg prefix, no crypto. Used for plain compose-box input (anything that
-    isn't a /msg <name> or /r whisper)."""
+    isn't a /msg <name> or /r whisper). Long lines are split to fit Hytale's CHAT_LIMIT
+    (an over-limit line gets you kicked)."""
+    pieces = crypto.split_public_lines(message)
     yd_sock, use_paste, saved = _prep_paste(paste_method)
     focus_game()
     time.sleep(T_SETTLE)
-    _send_line(message, open_key, type_delay_ms, paste_method, yd_sock, use_paste)
+    for idx, piece in enumerate(pieces):
+        _send_line(piece, open_key, type_delay_ms, paste_method, yd_sock, use_paste)
+        if idx < len(pieces) - 1:
+            time.sleep(T_CHUNK_GAP)
     if use_paste and saved:
         _wl_copy(saved)
     return message

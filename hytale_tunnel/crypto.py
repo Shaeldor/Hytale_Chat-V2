@@ -149,6 +149,46 @@ CHAT_LIMIT = 255             # Hytale max chars for a single chat message
 _CHUNK_HEADER = 8            # msgid(4 hex) + part(2 hex) + total(2 hex)
 
 
+def split_public_lines(line: str, limit: int = CHAT_LIMIT) -> list[str]:
+    """Split an UNENCRYPTED chat line so each piece fits Hytale's CHAT_LIMIT.
+
+    Sending a longer-than-limit line gets you kicked (the server rejects the oversized
+    chat frame), so plain/public messages must be split just like encrypted ones are
+    chunked. Splits on word boundaries (hard-splitting a single over-long word), and
+    preserves a leading '/msg <name> ' command prefix on every piece so a long unencrypted
+    whisper stays a whisper across all its parts (rather than leaking the tail to public)."""
+    if len(line) <= limit:
+        return [line]
+    prefix, body = "", line
+    if line.startswith("/msg "):
+        sp = line.find(" ", len("/msg "))
+        if sp != -1:
+            prefix, body = line[:sp + 1], line[sp + 1:]   # "/msg <name> " + rest
+    budget = max(1, limit - len(prefix))
+    return [prefix + piece for piece in _wrap_words(body, budget)]
+
+
+def _wrap_words(text: str, budget: int) -> list[str]:
+    out: list[str] = []
+    cur = ""
+    for word in text.split(" "):
+        while len(word) > budget:                    # a single word longer than a whole line
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(word[:budget])
+            word = word[budget:]
+        candidate = word if not cur else cur + " " + word
+        if len(candidate) <= budget:
+            cur = candidate
+        else:
+            out.append(cur)
+            cur = word
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
 def _psk_path(name: str) -> Path:
     return FRIENDS_DIR / f"{name}.key"
 

@@ -225,6 +225,15 @@ def parse_all(raw: bytes) -> list[ChatLine]:
     """
     offsets = [m.start() for m in _SIG_RE.finditer(raw)]
     lines: list[ChatLine] = []
+    if not offsets:
+        # No d2 chat-log signature in this buffer -- but some chat lines arrive in a
+        # variant framing WITHOUT the d2 header (they still carry \x07#colour runs).
+        # Previously these were silently dropped (the "MISSHEX" case); recover the line
+        # from its runs so every message is displayed.
+        runs = parse_runs(raw)
+        if runs:
+            lines.append(classify("".join(t for t, _ in runs), runs))
+        return lines
     for i, off in enumerate(offsets):
         end = offsets[i + 1] if i + 1 < len(offsets) else len(raw)
         runs = parse_runs(raw[off:end])

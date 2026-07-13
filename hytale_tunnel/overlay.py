@@ -18,10 +18,32 @@ from . import emoji_util
 
 FONT_SIZE_PX = int(os.environ.get("HYTALE_TUNNEL_FONT_SIZE", "14"))
 
-# Transcript background opacity (0 = fully transparent "just text", 255 = solid). Kept
-# low so the overlay is mostly see-through; text itself stays fully opaque. The compose
-# box uses a bit more so it's easy to find. Tune with HYTALE_TUNNEL_BG_ALPHA.
-BG_ALPHA = max(0, min(255, int(os.environ.get("HYTALE_TUNNEL_BG_ALPHA", "12"))))
+# Font family for all chat text. Default is the generic monospace; override with
+# HYTALE_TUNNEL_FONT, the --font flag, or the in-overlay `/font <name>` command. Any
+# installed family works (e.g. "Fira Code", "JetBrains Mono", "sans-serif").
+FONT_FAMILY = os.environ.get("HYTALE_TUNNEL_FONT", "monospace")
+
+
+def _norm_family(name: str | None) -> str:
+    """Normalize a font-family choice; 'default'/'reset' map back to the configured default."""
+    name = (name or "").strip() or FONT_FAMILY
+    return FONT_FAMILY if name.lower() in ("default", "reset") else name
+
+
+def _css_family(name: str) -> str:
+    """A font-family value safe for a Qt stylesheet: quote real family names (handles spaces
+    and odd characters), but leave the generic keywords (monospace/serif/sans-serif) unquoted
+    so Qt resolves them as generics rather than hunting for a family literally named that."""
+    name = (name or "monospace").strip()
+    if name.lower() in ("monospace", "serif", "sans-serif", "cursive", "fantasy"):
+        return name.lower()
+    return f'"{name}"'
+
+# Background opacity behind the text (0 = fully transparent "just text", 255 = solid). A
+# dark tone makes messages readable over any game background; text itself stays fully
+# opaque. The compose box uses a bit more so it's easy to find. Tune (0-255) with
+# HYTALE_TUNNEL_BG_ALPHA -- lower it for a more see-through overlay.
+BG_ALPHA = max(0, min(255, int(os.environ.get("HYTALE_TUNNEL_BG_ALPHA", "110"))))
 
 # Rank/name/body colours come straight off the wire -- tuned for the game's own UI,
 # not our translucent near-black overlay (rgba ~10,12,16). A dark red (or any dark
@@ -57,7 +79,7 @@ class Overlay(QtWidgets.QWidget):
         super().changeEvent(event)
 
     def __init__(self, recipient: str, friends: list[str],
-                 font_px: int | None = None, size=None):
+                 font_px: int | None = None, size=None, font_family: str | None = None):
         super().__init__()
         self.recipient = recipient
         self._collapsed = False
@@ -65,6 +87,7 @@ class Overlay(QtWidgets.QWidget):
         self._entries = []          # ordered [(kind, payload)] so filters can re-render
         self._filter_idx = 0
         self._font_px = font_px or FONT_SIZE_PX
+        self._font_family = _norm_family(font_family)
         self._expanded_size = QtCore.QSize(*size) if size else QtCore.QSize(440, 320)
         self.setWindowTitle("hytale-tunnel")    # Hyprland matches this for window rules
         self.setWindowFlags(
@@ -78,6 +101,11 @@ class Overlay(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
+        # Don't let the layout's content minimum become the WINDOW's minimum size. Otherwise a
+        # tall passive HUD (many/long messages) reports a big min-height, Hyprland refuses to
+        # shrink the window back down on close, and it stays tall + creeps upward each cycle.
+        # With no constraint the window can be any size and content just clips/scrolls.
+        root.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetNoConstraint)
 
         # --- header (stays visible in both states; doubles as the collapse pill) ---
         self.header = QtWidgets.QWidget()
@@ -137,15 +165,25 @@ class Overlay(QtWidgets.QWidget):
         self.view = QtWidgets.QTextEdit(readOnly=True)
         body.addWidget(self.view, 1)
         # Passive HUD: a bottom-anchored stack of individually-fading lines shown while the
-        # game is focused (pure floating text, no chrome). Each line fades on its own timer.
+        # game is focused (pure floating text, no chrome). The lines sit inside ONE shared,
+        # semi-transparent panel (not per-message bubbles) so they read as a single chat
+        # background; each line's text still fades out on its own timer.
         self.hud = QtWidgets.QWidget()
-        self._hud_layout = QtWidgets.QVBoxLayout(self.hud)
-        self._hud_layout.setContentsMargins(4, 0, 4, 0)
-        self._hud_layout.setSpacing(2)
-        self._hud_layout.addStretch(1)           # pin lines to the bottom
+        hud_outer = QtWidgets.QVBoxLayout(self.hud)
+        hud_outer.setContentsMargins(0, 0, 0, 0)
+        hud_outer.setSpacing(0)
+        hud_outer.addStretch(1)                  # pin the panel to the bottom
+        self._hud_panel = QtWidgets.QWidget()
+        self._hud_panel.setStyleSheet(
+            f"background: rgba(10,12,16,{BG_ALPHA}); border-radius:6px;")
+        self._hud_layout = QtWidgets.QVBoxLayout(self._hud_panel)
+        self._hud_layout.setContentsMargins(8, 5, 8, 5)
+        self._hud_layout.setSpacing(1)
+        hud_outer.addWidget(self._hud_panel)
+        self._hud_panel.setVisible(False)        # only shown once it holds a line
         self._hud_lines = []
         body.addWidget(self.hud, 1)
-        self.input = QtWidgets.QLineEdit()
+        self.input = _ComposeEdit()
         self.input.setPlaceholderText("Type your message here...")
         self.input.returnPressed.connect(self._on_submit)
         body.addWidget(self.input)
@@ -162,6 +200,10 @@ class Overlay(QtWidgets.QWidget):
         self.input.setVisible(False)             # shown only when opened (focused)
         self._sync_visibility()
 
+        # ESC unfocuses the chat (hands focus back to the game), just like SUPER+SHIFT+P.
+        # It's a WindowShortcut, so it only fires while the overlay is focused -> ESC can
+        # only UNfocus, never focus (and it never reaches the game's menu while we're typing).
+        QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self.dismissed.emit)
         # Focused-only fallbacks for font size (the global SUPER+SHIFT+± binds go
         # through Hyprland -> SIGRTMIN; these work when the overlay itself has focus).
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+="), self, activated=lambda: self.bump_font(1))
@@ -172,16 +214,34 @@ class Overlay(QtWidgets.QWidget):
     _FONT_MIN, _FONT_MAX = 8, 40
 
     def _apply_font(self) -> None:
-        """(Re)apply the current font size + transparency to the transcript + input."""
+        """(Re)apply the current font family + size + transparency to the transcript + input."""
         in_alpha = min(235, BG_ALPHA + 70)      # compose box a touch more visible
+        fam = _css_family(self._font_family)
         self.view.setStyleSheet(
             f"QTextEdit{{background:rgba(10,12,16,{BG_ALPHA}); color:#e6e6e6;"
             "border:none; border-radius:6px; padding:4px;"
-            f"font-family:monospace; font-size:{self._font_px}px;}}")
+            f"font-family:{fam}; font-size:{self._font_px}px;}}")
         self.input.setStyleSheet(
             f"QLineEdit{{background:rgba(20,24,30,{in_alpha}); color:#fff;"
             "border:1px solid rgba(90,100,120,110); border-radius:6px; padding:5px;"
-            f"font-size:{self._font_px}px;}}")
+            f"font-family:{fam}; font-size:{self._font_px}px;}}")
+
+    def set_font_family(self, name: str) -> bool:
+        """Change the chat font family, re-render, and report whether `name` is an installed
+        family (Qt still applies + falls back to a close match if not)."""
+        self._font_family = _norm_family(name)
+        self._apply_font()
+        if not self._collapsed and not self._opened:
+            self._render_passive()               # reseed HUD lines in the new font
+        if self._font_family.lower() in ("monospace", "serif", "sans-serif", "cursive", "fantasy"):
+            return True                          # generics always resolve
+        fams = QtGui.QFontDatabase.families()
+        return any(self._font_family.lower() == f.lower() for f in fams)
+
+    @staticmethod
+    def available_fonts() -> list[str]:
+        """Installed font families (for the /font list command)."""
+        return list(QtGui.QFontDatabase.families())
 
     def bump_font(self, delta: int) -> None:
         """Grow/shrink the chat font by `delta` px (clamped). No-op at the limits."""
@@ -322,22 +382,26 @@ class Overlay(QtWidgets.QWidget):
     def _hud_add(self, html_text: str) -> None:
         """Append one line to the passive HUD; it lingers, then fades on its own timer."""
         line = _FadingLine(html_text, self._font_px, self._LINGER_MS,
-                           self._FADE_MS, self._hud_remove)
+                           self._FADE_MS, self._hud_remove, self._font_family)
         self._hud_lines.append(line)
-        self._hud_layout.addWidget(line)         # after the stretch => at the bottom
+        self._hud_layout.addWidget(line)
         while len(self._hud_lines) > self._PASSIVE_MAX:
             self._hud_lines.pop(0).kill()
+        self._hud_panel.setVisible(True)
 
     def _hud_remove(self, line) -> None:
         """A line finished fading (or is being culled): drop it from the HUD."""
         if line in self._hud_lines:
             self._hud_lines.remove(line)
         line.kill()
+        if not self._hud_lines:                  # nothing left -> hide the shared panel
+            self._hud_panel.setVisible(False)
 
     def _hud_clear(self) -> None:
         for line in self._hud_lines:
             line.kill()
         self._hud_lines = []
+        self._hud_panel.setVisible(False)
 
     def _render_passive(self) -> None:
         """Reseed the HUD with the most recent visible lines (each starts its own fade)."""
@@ -486,13 +550,76 @@ class Overlay(QtWidgets.QWidget):
         bar = self.view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def prefill(self, text: str) -> None:
+        """Put `text` in the compose box with the cursor at the end (used by the '/' quick-
+        command hotkey). Only meaningful when opened; the input holds it either way."""
+        self.input.setText(text)
+        self.input.setCursorPosition(len(text))
+        self.input.deselect()
+        self.input.setFocus()
+
     def _on_submit(self) -> None:
         text = self.input.text().strip()
         if text:
+            self.input.remember(text)           # add to the Up/Down recall history
             self.input.clear()
             self.submitted.emit(text)
         else:
             self.dismissed.emit()               # empty Enter -> hand focus back to the game
+
+
+class _ComposeEdit(QtWidgets.QLineEdit):
+    """The compose box, with in-game-style Up/Down recall of previously sent lines.
+
+    Up walks back through history (most-recent first); Down walks forward again and,
+    past the newest, restores whatever draft you were typing. The recalled text just
+    populates the box -- you can send it as-is or edit it first, like Hytale's own chat."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._history: list[str] = []   # submitted lines, oldest -> newest
+        self._idx: int | None = None    # None = editing the live draft; else index in history
+        self._draft = ""                # the draft saved when you start browsing up
+
+    def remember(self, text: str) -> None:
+        """Record a just-submitted line and reset the browse position to the draft."""
+        if text and (not self._history or self._history[-1] != text):
+            self._history.append(text)
+        self._idx = None
+        self._draft = ""
+
+    def keyPressEvent(self, e) -> None:
+        key = e.key()
+        if key == QtCore.Qt.Key.Key_Up:
+            self._browse(-1)
+            return
+        if key == QtCore.Qt.Key.Key_Down:
+            self._browse(+1)
+            return
+        super().keyPressEvent(e)
+
+    def _browse(self, direction: int) -> None:
+        if not self._history:
+            return
+        if direction < 0:                        # Up: older
+            if self._idx is None:                # leaving the draft -> newest history entry
+                self._draft = self.text()
+                self._idx = len(self._history) - 1
+            elif self._idx > 0:
+                self._idx -= 1
+            else:
+                return                           # already at the oldest
+        else:                                    # Down: newer
+            if self._idx is None:
+                return                           # already at the draft
+            self._idx += 1
+            if self._idx >= len(self._history):  # past the newest -> back to the draft
+                self._idx = None
+                self.setText(self._draft)
+                self.end(False)
+                return
+        self.setText(self._history[self._idx])
+        self.end(False)                          # cursor to end, no selection
 
 
 class _FadingLine(QtWidgets.QLabel):
@@ -501,17 +628,26 @@ class _FadingLine(QtWidgets.QLabel):
     its own timer, so messages fade independently (not the whole transcript at once)."""
 
     def __init__(self, html_text: str, font_px: int, linger_ms: int,
-                 fade_ms: int, on_dead) -> None:
+                 fade_ms: int, on_dead, font_family: str = "monospace") -> None:
         super().__init__()
         self._on_dead = on_dead
         self.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self.setText(html_text)
         self.setWordWrap(True)
+        # A word-wrapped QLabel must advertise height-for-width, else a layout gives it a
+        # one-line height and a 3-line message overlaps the line below it. Force it so wrapped
+        # lines get their full vertical space.
+        sp = self.sizePolicy()
+        sp.setHeightForWidth(True)
+        sp.setVerticalPolicy(QtWidgets.QSizePolicy.Policy.Minimum)
+        self.setSizePolicy(sp)
+        self.setText(html_text)
         self.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.NoTextInteraction)
         # Don't intercept the mouse -- the game keeps it while these float on top.
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setStyleSheet("background:transparent; color:#e6e6e6;"
-                           f"font-family:monospace; font-size:{font_px}px;")
+        # Transparent: the shared HUD panel behind the lines provides the background, so the
+        # messages read as one block rather than separate per-message boxes.
+        self.setStyleSheet("background: transparent; color:#e6e6e6;"
+                           f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
         self._eff = QtWidgets.QGraphicsOpacityEffect(self)
         self._eff.setOpacity(1.0)
         self.setGraphicsEffect(self._eff)

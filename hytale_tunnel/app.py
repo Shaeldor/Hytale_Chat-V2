@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 from PyQt6 import QtCore, QtWidgets
 
@@ -20,6 +21,24 @@ from .chatframe import Msg
 from .overlay import Overlay
 
 LINUX = sys.platform.startswith("linux")
+
+# Optional geometry trace: set HYTALE_GEO_DEBUG=/path to log every open/close/persist/
+# collapse decision + the geometry it read/applied, for diagnosing the "window drifts /
+# gets short after moving or pilling" bug. No-op unless the env var is set.
+_GEO_DBG = None
+if os.environ.get("HYTALE_GEO_DEBUG"):
+    try:
+        _GEO_DBG = open(os.environ["HYTALE_GEO_DEBUG"], "a", buffering=1)
+    except OSError:
+        _GEO_DBG = None
+
+
+def _glog(tag: str, **kw) -> None:
+    if _GEO_DBG:
+        try:
+            _GEO_DBG.write(tag + " " + " ".join(f"{k}={v}" for k, v in kw.items()) + "\n")
+        except OSError:
+            pass
 
 # Persisted overlay layout (position, size, font, recipient) so the overlay comes back
 # exactly where you left it. Written on change (polled) and on exit; loaded at startup.
@@ -138,6 +157,9 @@ def main() -> int:
                     "'hytalecrypt gengroupkey' + 'setgroupkey <name> <key>'")
     ap.add_argument("--me", help="your in-game name (auto-detected from the client "
                     "log if omitted); used to render your own messages as 'you'")
+    ap.add_argument("--font", help="chat font family (any installed font, e.g. 'Fira Code'); "
+                    "default: your saved choice or monospace. Change it live with '/font <name>' "
+                    "in the compose box; list installed fonts with '/font list'.")
     ap.add_argument("--show-system", action="store_true",
                     help="also show server/console lines ([!], [Duel], joins, …); by "
                          "default only messages sent by players are shown")
@@ -194,8 +216,16 @@ def main() -> int:
     if recipient not in friends:
         recipient = friends[0]
     saved_font = state.get("font_px") if isinstance(state.get("font_px"), int) else None
+    # Font family: explicit --font > saved choice > default (monospace, handled by Overlay).
+    saved_family = args.font or (state.get("font_family")
+                                 if isinstance(state.get("font_family"), str) else None)
     saved_size = ((state["w"], state["h"]) if isinstance(state.get("w"), int)
                   and isinstance(state.get("h"), int) else None)
+    # Defend against a corrupted (grown) passive height leaking in from an older build:
+    # the passive HUD should be short; an absurd height would make it (and the ×grow on
+    # open) fill the screen. Clamp back to a sane default.
+    if saved_size and saved_size[1] > 550:
+        saved_size = (saved_size[0], 320)
     saved_pos = ((state["x"], state["y"]) if isinstance(state.get("x"), int)
                  and isinstance(state.get("y"), int) else None)
     party_group = _pick_party_group(crypto.list_groups(), args.party)
@@ -221,7 +251,8 @@ def main() -> int:
     # which Qt sets slightly later -- the title race left rules unapplied at random.
     QtWidgets.QApplication.setDesktopFileName("hytale-tunnel")
     app = QtWidgets.QApplication(sys.argv)
-    ui = Overlay(recipient, friends, font_px=saved_font, size=saved_size)
+    ui = Overlay(recipient, friends, font_px=saved_font, size=saved_size,
+                 font_family=saved_family)
     ui.refresh_friends(friends, crypto.list_incoming_requests())   # surface leftover requests
 
     my_name = playername.detect(args.me)
@@ -288,7 +319,8 @@ def main() -> int:
     # Global collapse/expand toggle from anywhere (even when the game is focused):
     # a Hyprland keybind sends SIGUSR1 to this process. The flag is consumed by the
     # drain timer so the toggle happens on the Qt main thread.
-    toggle = {"pending": False, "quit": False, "font": 0, "open": False}
+    toggle = {"pending": False, "quit": False, "font": 0, "open": False,
+              "open_slash": False}
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, lambda *_: toggle.__setitem__("pending", True))
     # Global font resize (SUPER+SHIFT+± via Hyprland -> real-time signals). RT signals
@@ -299,6 +331,8 @@ def main() -> int:
         signal.signal(signal.SIGRTMIN + 1, lambda *_: toggle.__setitem__("font", toggle["font"] + 1))
         signal.signal(signal.SIGRTMIN + 2, lambda *_: toggle.__setitem__("font", toggle["font"] - 1))
         signal.signal(signal.SIGRTMIN + 3, lambda *_: toggle.__setitem__("open", True))
+        # SIGRTMIN+4 = "open & focus the chat, pre-filled with '/'" (the slash quick-command key).
+        signal.signal(signal.SIGRTMIN + 4, lambda *_: toggle.__setitem__("open_slash", True))
     # Graceful shutdown so the `finally` block runs and removes the PID file
     # (SIGTERM/SIGINT would otherwise kill us without cleanup, leaving a stale pid).
     for _signame in ("SIGTERM", "SIGINT"):
@@ -331,15 +365,22 @@ def main() -> int:
             return False
 
     def _set_enter_bind(on: bool) -> None:
+        # Manages BOTH quick-open keys, armed under the same condition (tunnel expanded + game
+        # focused): Enter opens the compose bar; '/' opens it pre-filled with '/' for commands.
         if not LINUX or _bind_state["on"] is on:
             return
         _bind_state["on"] = on
         if on:
-            cmd = f"/usr/bin/kill --signal RTMIN+3 {os.getpid()} 2>/dev/null"
-            subprocess.run(["hyprctl", "keyword", "bind", f", Return, exec, {cmd}"],
+            pid = os.getpid()
+            enter = f"/usr/bin/kill --signal RTMIN+3 {pid} 2>/dev/null"
+            slash = f"/usr/bin/kill --signal RTMIN+4 {pid} 2>/dev/null"
+            subprocess.run(["hyprctl", "keyword", "bind", f", Return, exec, {enter}"],
+                           capture_output=True)
+            subprocess.run(["hyprctl", "keyword", "bind", f", slash, exec, {slash}"],
                            capture_output=True)
         else:
             subprocess.run(["hyprctl", "keyword", "unbind", ", Return"], capture_output=True)
+            subprocess.run(["hyprctl", "keyword", "unbind", ", slash"], capture_output=True)
 
     def _update_enter_bind() -> None:
         # Enter hotkey ON only while the tunnel is EXPANDED and the GAME is the focused
@@ -347,13 +388,14 @@ def main() -> int:
         # in the tunnel itself (submit) or in other apps (terminal, browser).
         _set_enter_bind((not ui._collapsed) and _game_focused())
 
-    # While the tunnel is focused, turn OFF Hyprland's follow-mouse so the cursor can move
-    # into the chat (to click/select) without the game stealing focus back. Restore the
-    # user's original setting when the tunnel isn't focused.
-    _mouse = {"free": None, "orig": None}
+    # Keep Hyprland's follow-mouse OFF for the whole tunnel session: hovering the overlay must
+    # NOT focus it (that was auto-opening/growing it), and while typing the cursor can drift
+    # over the game without stealing focus back. The user's original setting is restored on
+    # exit. (Focus then changes only by click or by our hotkeys -- exactly what we want.)
+    _mouse = {"off": False, "orig": None}
 
-    def _set_free_mouse(free: bool) -> None:
-        if not LINUX or _mouse["free"] is free:
+    def _mouse_focus_off(off: bool) -> None:
+        if not LINUX or _mouse["off"] is off:
             return
         if _mouse["orig"] is None:
             try:
@@ -363,10 +405,35 @@ def main() -> int:
                                        if w.strip().startswith("int:")), 1)
             except Exception:                        # noqa: BLE001
                 _mouse["orig"] = 1
-        _mouse["free"] = free
-        val = 0 if free else _mouse["orig"]
+        _mouse["off"] = off
+        val = 0 if off else _mouse["orig"]
         subprocess.run(["hyprctl", "keyword", "input:follow_mouse", str(val)],
                        capture_output=True)
+
+    def _refresh_mouse_focus() -> None:
+        """Keep follow-mouse OFF while the GAME or the CHAT is the focused window (so hovering
+        the overlay can't focus/open it, and typing is stable), and restore the user's setting
+        when some other app is focused. Polled + called on focus changes."""
+        _mouse_focus_off(ui.isActiveWindow() or _game_focused())
+
+    def _cursor_over_overlay() -> bool:
+        """True if the mouse cursor is currently over the tunnel window -- used to tell a
+        CLICK on the overlay (cursor on it) from a hotkey focus (cursor elsewhere)."""
+        if not LINUX:
+            return False
+        try:
+            cp = json.loads(subprocess.run(["hyprctl", "-j", "cursorpos"],
+                                           capture_output=True, text=True).stdout or "{}")
+            clients = json.loads(subprocess.run(["hyprctl", "-j", "clients"],
+                                                capture_output=True, text=True).stdout or "[]")
+            w = next((c for c in clients if c.get("class") == "hytale-tunnel"), None)
+            if not w:
+                return False
+            ax, ay = w["at"]
+            ww, hh = w["size"]
+            return ax <= cp.get("x", -1) < ax + ww and ay <= cp.get("y", -1) < ay + hh
+        except Exception:                            # noqa: BLE001
+            return False
 
     def _focus_overlay() -> None:
         _focus_window("hytale-tunnel")
@@ -374,16 +441,24 @@ def main() -> int:
         ui.activateWindow()
         ui.input.setFocus()
         _set_enter_bind(False)                       # tunnel now focused -> Enter must submit
-        _set_free_mouse(True)                        # cursor can roam the chat freely
 
     def _focus_game() -> None:
         _focus_window("HytaleClient")
-        _set_free_mouse(False)
         QtCore.QTimer.singleShot(60, _update_enter_bind)   # let focus settle, then re-arm
 
     def _on_activation(active: bool) -> None:
-        _set_free_mouse(active)
+        _glog("activation", active=active, opened=ui._opened, collapsed=ui._collapsed)
         _update_enter_bind()
+        _refresh_mouse_focus()
+        # If the PASSIVE HUD got focus from a mouse CLICK on it (cursor over it) rather than a
+        # hotkey, the user didn't ask to open it -> bounce focus straight back to the game and
+        # don't grow. (Only while the game is on this workspace, so a click elsewhere still
+        # opens it normally.)
+        if (active and not ui._opened and not ui._collapsed
+                and _cursor_over_overlay() and _game_on_active_ws()):
+            _glog("activation.bounce")
+            QtCore.QTimer.singleShot(0, _focus_game)
+            return
         changed = active != ui._opened
         ui.set_opened(active)                         # focused => full history; else => fading HUD
         if LINUX and changed and not ui._collapsed:
@@ -467,13 +542,18 @@ def main() -> int:
         if toggle["pending"]:
             toggle["pending"] = False
             ui.toggle_collapsed()
-        if toggle["open"]:                   # Enter/'\' hotkey: focus the compose bar
+        if toggle["open"]:                   # Enter hotkey: focus the compose bar
             toggle["open"] = False
-            if ui._collapsed:                # from the pill: expand, then focus once it settles
-                ui.set_collapsed(False)
-                QtCore.QTimer.singleShot(120, _focus_overlay)
-            else:                            # already expanded (the usual case): focus NOW, no delay
+            # Only focus from the PASSIVE HUD; in pill mode Enter must do nothing to the
+            # tunnel (use SUPER+SHIFT+J to expand the pill). Guard also stops a stray Return
+            # bind (left armed for a moment) from popping the chat open out of the pill.
+            if not ui._collapsed:
                 _focus_overlay()
+        if toggle["open_slash"]:             # '/' hotkey: open + pre-fill '/' for a command
+            toggle["open_slash"] = False
+            if not ui._collapsed:            # like Enter, only opens from the passive HUD
+                _focus_overlay()
+                QtCore.QTimer.singleShot(80, lambda: ui.prefill("/"))
         if toggle["font"]:
             delta, toggle["font"] = toggle["font"], 0
             ui.bump_font(delta)
@@ -519,6 +599,23 @@ def main() -> int:
         _sig_notifier.activated.connect(_on_signal_wakeup)
         _sig_socks = (_wsock, _rsock, _sig_notifier)   # keep alive for the app's lifetime
 
+    def _do_font(text: str) -> None:
+        arg = text[len("/font"):].strip()
+        if not arg:
+            inbox.put((SYS, f"current font: {ui._font_family}.  Usage: /font <family> "
+                            "(e.g. /font Fira Code).  '/font list' shows installed fonts; "
+                            "'/font monospace' resets."))
+            return
+        if arg.lower() == "list":
+            fams = ui.available_fonts()
+            inbox.put((SYS, f"{len(fams)} fonts installed. A few: "
+                            + ", ".join(fams[:40]) + (" …" if len(fams) > 40 else "")))
+            return
+        found = ui.set_font_family(arg)
+        inbox.put((SYS, f"font set to {arg}" if found
+                   else f"'{arg}' not found — applied closest match. '/font list' to see options."))
+        persist()
+
     def on_submit(text: str) -> None:
         text = text.strip()
         if not text:
@@ -527,6 +624,9 @@ def main() -> int:
             _do_friend(text)
             if LINUX:
                 QtCore.QTimer.singleShot(60, _focus_game)
+            return
+        if text.split(None, 1)[0].lower() == "/font":
+            _do_font(text)                       # keep the chat focused so you can try more
             return
         mode, friend, body = _parse_command(text, last_contact)
         if mode == "error":
@@ -635,59 +735,122 @@ def main() -> int:
     # resize doesn't), so we drive size with `resizewindowpixel` and then position with
     # `movewindowpixel` -- the same compositor-side path we already use for moving.
     _TOP_MARGIN = 8
+    _GROW = 1.6                       # opened height = _GROW × passive height (bottom-anchored)
+    # Geometry is "in flux" until this monotonic time; persist() won't read the live size
+    # during the window, so a transient (grown, or mid-resize) height can't be captured as
+    # the passive base -- that race is what leaked the ~2× height into overlay.json before.
+    geo_state = {"settle_until": 0.0, "gen": 0}
 
     def _apply_geo(x_rel: int, y_rel: int, w: int, h: int) -> None:
         """Resize (Hyprland) + position (monitor-relative). Coords are monitor-relative,
         like _query_geometry_linux / _position_top_right. Runs twice: the second pass is a
         safety net for the moment just after a pill-expand, where Qt hasn't yet committed its
-        cleared min/max size hints and the first resize could otherwise be clamped."""
+        cleared min/max size hints and the first resize could otherwise be clamped.
+
+        Each call bumps a generation; a queued pass runs only if it's still the newest call.
+        Without this, a fast open->close left the OPEN's 150ms pass to fire AFTER the close and
+        re-grow the window while it was 'closed' -- persist() then captured that grown height as
+        the passive base, so every cycle it crept taller and higher (the reported bug)."""
+        geo_state["settle_until"] = time.monotonic() + 0.7   # don't persist size mid-resize
+        geo_state["gen"] += 1
+        my_gen = geo_state["gen"]
         def go() -> None:
+            if my_gen != geo_state["gen"]:       # a newer geometry change superseded this one
+                return
             if LINUX:
-                subprocess.run(["hyprctl", "dispatch", "resizewindowpixel",
-                                f"exact {int(w)} {int(h)},class:^(hytale-tunnel)$"],
+                # Resize AND move in ONE atomic --batch dispatch so there's no visible
+                # move-then-resize two-step. Paired with `no_anim on`, the window snaps to the
+                # new geometry instantly. movewindowpixel wants GLOBAL coords, so add the focused
+                # monitor's origin to the monitor-relative x/y.
+                ox = oy = 0
+                try:
+                    mons = json.loads(subprocess.run(["hyprctl", "-j", "monitors"],
+                                                     capture_output=True, text=True).stdout)
+                    mon = next((m for m in mons if m.get("focused")), mons[0] if mons else {})
+                    ox, oy = int(mon.get("x", 0)), int(mon.get("y", 0))
+                except Exception:                # noqa: BLE001
+                    pass
+                cls = "class:^(hytale-tunnel)$"
+                subprocess.run(["hyprctl", "--batch",
+                                f"dispatch resizewindowpixel exact {int(w)} {int(h)},{cls} ; "
+                                f"dispatch movewindowpixel exact {ox + int(x_rel)} {oy + int(y_rel)},{cls}"],
                                capture_output=True)
             else:
                 ui.resize(int(w), int(h))
-            _position_top_right(ui, app, (x_rel, y_rel))
+                _position_top_right(ui, app, (x_rel, y_rel))
+            if _GEO_DBG:
+                _glog("apply", gen=my_gen, target=(int(x_rel), int(y_rel), int(w), int(h)),
+                      collapsed=ui._collapsed, opened=ui._opened)
+                QtCore.QTimer.singleShot(220, lambda: _glog(
+                    "apply.result", target=(int(x_rel), int(y_rel), int(w), int(h)),
+                    actual=_query_geometry_linux()))
         for delay in (0, 150):
             QtCore.QTimer.singleShot(delay, go)
 
-    def _sync_passive_geo() -> bool:
-        """Refresh passive_geo from the LIVE window (so dragging sticks). Returns True on
-        success. Call while the window is at its passive size (game-focused / just before
-        growing)."""
-        g = _query_geometry_linux() if LINUX else None
-        if g:
-            passive_geo.update(x=g[0], y=g[1], w=g[2], h=g[3])
-            return True
-        return False
-
+    # open/close geometry is FULLY DETERMINISTIC: it computes purely from the stored
+    # passive_geo and never reads the live window. That closes the feedback loop that made the
+    # window creep up/taller -- a bad live read (mid-transition, during a desktop switch, focus
+    # flapping) could otherwise get written back as the new base and compound every cycle. The
+    # only thing that ever updates passive_geo from the live window is persist(), and only when
+    # the window is confirmed to be AT passive size (so grown/transient geometry can't leak in).
     def _open_grow() -> None:
-        """passive -> opened: grow ~2x taller, bottom-anchored from wherever it sits now."""
-        _sync_passive_geo()                          # anchor to the current (maybe dragged) spot
+        """passive -> opened: grow taller (×_GROW), bottom-anchored, from the stored base."""
+        # Pick up a fresh passive drag right now, so open uses the CURRENT spot instead of a
+        # stale one (the persist poll can lag ~seconds behind a move). Guarded: only trust the
+        # read when the live window is at ≈ passive size, else it's a transient/pill frame.
+        g = _query_geometry_linux() if LINUX else None
+        if g and abs(g[2] - passive_geo["w"]) <= 12 and abs(g[3] - passive_geo["h"]) <= 12:
+            passive_geo["x"], passive_geo["y"] = g[0], g[1]
+            _glog("open.sync", live=g)
+        elif g:
+            _glog("open.sync-reject", live=g, pw=passive_geo["w"], ph=passive_geo["h"])
         x, y = passive_geo["x"], passive_geo["y"]
         w, h = passive_geo["w"], passive_geo["h"]
-        new_h = max(h, min(2 * h, y + h - _TOP_MARGIN))   # don't run off the monitor top
+        new_h = max(h, int(min(_GROW * h, y + h - _TOP_MARGIN)))   # don't run off the monitor top
+        _glog("open.grow", pg=(x, y, w, h), target=(x, y + h - new_h, w, new_h))
         _apply_geo(x, y + h - new_h, w, new_h)       # keep the bottom fixed; top rises
 
     def _close_shrink() -> None:
-        """opened -> passive: shrink back to the passive height, same bottom edge & x."""
+        """opened -> passive: restore the passive geometry. If the OPENED window was dragged
+        somewhere, capture that -- but ONLY when the live read really is the opened frame (size
+        ≈ the grown size). A transient/mid-transition/passive-sized read is rejected, so nothing
+        bogus can feed back into the base (no drift)."""
+        x0, y0 = passive_geo["x"], passive_geo["y"]
+        w0, h0 = passive_geo["w"], passive_geo["h"]
+        oh = max(h0, int(min(_GROW * h0, y0 + h0 - _TOP_MARGIN)))   # the height we grew to
         g = _query_geometry_linux() if LINUX else None
-        if g:                                        # respect a drag done while opened
-            x, _, w, h = g
-            bottom = g[1] + g[3]
+        if g and abs(g[2] - w0) <= 12 and abs(g[3] - oh) <= 12:      # a genuine opened frame
+            passive_geo["x"] = g[0]
+            passive_geo["y"] = max(0, g[1] + g[3] - h0)             # keep the (maybe dragged) bottom
+            _glog("close.capture", live=g, oh=oh, pg=(passive_geo["x"], passive_geo["y"]))
         else:
-            x, w = passive_geo["x"], passive_geo["w"]
-            bottom = passive_geo["y"] + passive_geo["h"]
-        ph = passive_geo["h"]
-        y = max(0, bottom - ph)
-        passive_geo.update(x=x, y=y, w=w)            # remember the (possibly dragged) spot
-        _apply_geo(x, y, w, ph)
-
-    def _place_passive() -> None:
+            _glog("close.reject", live=g, oh=oh, w0=w0, h0=h0)
         _apply_geo(passive_geo["x"], passive_geo["y"], passive_geo["w"], passive_geo["h"])
 
+    def _place_passive() -> None:
+        _glog("place_passive", pg=(passive_geo["x"], passive_geo["y"],
+                                   passive_geo["w"], passive_geo["h"]))
+        _apply_geo(passive_geo["x"], passive_geo["y"], passive_geo["w"], passive_geo["h"])
+
+    def _game_on_active_ws() -> bool:
+        """True if HytaleClient is on the currently-focused workspace. Lets collapse hand
+        focus back to the game WHEN the pill was covering the game, without yanking you to
+        the game's desktop if you collapse it from some other workspace."""
+        if not LINUX:
+            return False
+        try:
+            aw = json.loads(subprocess.run(["hyprctl", "-j", "activeworkspace"],
+                                           capture_output=True, text=True).stdout or "{}")
+            clients = json.loads(subprocess.run(["hyprctl", "-j", "clients"],
+                                                capture_output=True, text=True).stdout or "[]")
+            g = next((c for c in clients if c.get("class") == "HytaleClient"), None)
+            return bool(g) and g.get("workspace", {}).get("id") == aw.get("id")
+        except Exception:                            # noqa: BLE001
+            return False
+
     def _on_collapsed_changed() -> None:
+        _glog("collapsed_changed", collapsed=ui._collapsed, opened=ui._opened,
+              pg=(passive_geo["x"], passive_geo["y"], passive_geo["w"], passive_geo["h"]))
         _update_enter_bind()                     # pill => Enter hotkey off; expanded => depends
         if ui._collapsed:                        # pill sizes itself; just place it at the spot
             for delay in (0, 130):
@@ -699,10 +862,13 @@ def main() -> int:
         else:                                    # expanded into the passive HUD
             _place_passive()
         if ui._collapsed:
-            # collapsed back to the pill -> just drop the tunnel's focus; do NOT force the
-            # game to the front (that yanks you back after switching desktops / minimizing).
-            ui.clearFocus()
-            _set_free_mouse(False)                # restore normal follow-mouse
+            # collapsed back to the pill -> hand focus back to the game so you can keep
+            # playing without moving the mouse (but only if the game is on this workspace;
+            # otherwise just drop focus, so collapsing from another desktop doesn't yank you).
+            if _game_on_active_ws():
+                QtCore.QTimer.singleShot(0, _focus_game)
+            else:
+                ui.clearFocus()
         else:
             # enlarged -> focus the compose bar so you can type right away
             QtCore.QTimer.singleShot(180, _focus_overlay)
@@ -717,17 +883,30 @@ def main() -> int:
     def persist() -> None:
         if ui._collapsed:
             return
-        st = {"font_px": ui._font_px, "recipient": ui.recipient}
-        # Only the PASSIVE HUD size/pos is the persisted base. While OPENED the window is
-        # grown ~2x taller, so don't capture that -- keep the last-known base geometry (but
-        # still persist font/recipient changes made while opened).
+        st = {"font_px": ui._font_px, "recipient": ui.recipient,
+              "font_family": ui._font_family}
+        # Only the PASSIVE HUD size/pos is the persisted base. Capture geometry ONLY when
+        # the window is stably at passive size: never while opened (grown ×_GROW), and never
+        # during the post-transition settle window -- else the grown/mid-resize height leaks
+        # in as the base (the bug that made "open" balloon to >2×). Font/recipient still save.
         geo = None
-        if not ui._opened:
+        if not ui._opened and time.monotonic() >= geo_state["settle_until"]:
             geo = _query_geometry_linux() if LINUX else (
                 lambda g: (g.x(), g.y(), g.width(), g.height()))(ui.frameGeometry())
         if geo:
-            st["x"], st["y"], st["w"], st["h"] = geo
-            passive_geo.update(x=geo[0], y=geo[1], w=geo[2], h=geo[3])
+            gx, gy, gw, gh = geo
+            # Capture a move ONLY when the live window is at (≈) passive size -- that proves
+            # it's the settled passive HUD, not a grown/mid-transition frame. This is the ONLY
+            # place passive_geo tracks the live window, so a bad read can never compound into
+            # the base (which is what made it creep upward/taller). A pure size change (drag an
+            # edge) isn't captured -- position drags are.
+            captured = abs(gw - passive_geo["w"]) <= 12 and abs(gh - passive_geo["h"]) <= 12
+            if captured:
+                passive_geo["x"], passive_geo["y"] = gx, gy
+            _glog("persist", live=geo, captured=captured,
+                  pg=(passive_geo["x"], passive_geo["y"], passive_geo["w"], passive_geo["h"]))
+            st["x"], st["y"] = passive_geo["x"], passive_geo["y"]
+            st["w"], st["h"] = passive_geo["w"], passive_geo["h"]
         else:                                    # keep last-known geometry if unreadable/opened
             for k in ("x", "y", "w", "h"):
                 if k in saved_state["last"]:
@@ -747,13 +926,17 @@ def main() -> int:
     scanner.start()
     ui.show()
     _place_passive()
+    _refresh_mouse_focus()               # hovering the overlay must not focus/open it
 
     # Arm the Enter hotkey from whoever is actually focused right now, and re-check every
     # second so a direct game->other-app switch (no overlay focus event) can't leave Enter
-    # hijacked in that app.
-    QtCore.QTimer.singleShot(600, _update_enter_bind)
+    # hijacked in that app OR leave follow-mouse off in some unrelated app.
+    def _poll_focus_state() -> None:
+        _update_enter_bind()
+        _refresh_mouse_focus()
+    QtCore.QTimer.singleShot(600, _poll_focus_state)
     enter_timer = QtCore.QTimer()
-    enter_timer.timeout.connect(_update_enter_bind)
+    enter_timer.timeout.connect(_poll_focus_state)
     enter_timer.start(1000)
 
     try:
@@ -761,7 +944,7 @@ def main() -> int:
     finally:
         persist()                            # capture wherever it was left
         _set_enter_bind(False)               # never leave Enter hijacked after we exit
-        _set_free_mouse(False)               # restore the user's follow-mouse setting
+        _mouse_focus_off(False)              # restore the user's follow-mouse setting
         stop.set()
         for p in proc_holder:                # stop the elevated capture process
             try:

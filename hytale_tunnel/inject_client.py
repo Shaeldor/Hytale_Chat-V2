@@ -18,7 +18,7 @@ def lines_for(mode: str, target: str | None, message: str) -> list[str]:
         return [f"/msg {target} {t}" for t in crypto.encrypt_messages(target, message)]
     if mode == "party":
         return [f"{crypto.PARTY_PREFIX}{t}" for t in crypto.encrypt_group_messages(target, message)]
-    return [message]                                # public: raw line, no crypto
+    return crypto.split_public_lines(message)       # public: raw, but split to fit CHAT_LIMIT
 
 
 class Injector:
