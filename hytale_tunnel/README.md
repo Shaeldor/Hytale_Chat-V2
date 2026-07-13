@@ -82,14 +82,19 @@ source = ~/.local/lib/hytale_tunnel/hyprland.conf
 After editing the file run `hyprctl reload` to apply it (and to drop any old
 `size`/`nofocus` rules from earlier versions).
 
-**`Esc` collapses the overlay to a small always-on-top pill** (it shows a `● N`
-badge for unread messages); click the pill to expand. `Esc` only fires while the
-overlay itself is focused, though — to collapse/expand **while the game is
-focused**, use the global keybind in `hyprland.conf`
-(`SUPER+SHIFT+J` by default), which signals the running tunnel. Pick a combo that
-doesn't clash with your setup — JaKooLit binds a lot of `SUPER` keys; check with
-`hyprctl binds | grep -iE 'SUPER'`. On Windows there's no global hotkey; just click
-the pill.
+**Opening the chat to type:** while the game is focused the overlay is a *passive*,
+chrome-less HUD — just the most recent lines floating over the game, each fading out
+on its own timer. Press **`SUPER+SHIFT+P`** (focus toggle) or **`Enter`** to focus it:
+the compose box appears (keyboard focus lands in it right away) and the window grows
+~2× taller, upward, so you can see more history. Press **`Enter`** again (empty box) or
+**`SUPER+SHIFT+P`** to hand focus back to the game — it shrinks back to the floating HUD.
+`Esc` does nothing (it's Hytale's own menu key).
+
+**`SUPER+SHIFT+J` collapses the overlay to a small always-on-top pill** (it shows a
+`● N` badge for unread messages); click the pill to expand. This global keybind works
+even while the game is focused. Pick a combo that doesn't clash with your setup —
+JaKooLit binds a lot of `SUPER` keys; check with `hyprctl binds | grep -iE 'SUPER'`.
+On Windows there's no global hotkey; just click the pill.
 
 ## Tuning the send key
 

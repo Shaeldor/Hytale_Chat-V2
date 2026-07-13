@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -199,6 +200,16 @@ def main() -> int:
                  and isinstance(state.get("y"), int) else None)
     party_group = _pick_party_group(crypto.list_groups(), args.party)
 
+    # PASSIVE (floating-HUD) window geometry = the short size/position you leave it at while
+    # gaming. Opening the chat grows it ~2x taller, bottom-anchored; closing restores this.
+    # It's refreshed from the LIVE window (so dragging it sticks) and is the geometry we save.
+    passive_geo = {
+        "x": saved_pos[0] if saved_pos else 60,
+        "y": saved_pos[1] if saved_pos else 700,
+        "w": saved_size[0] if saved_size else 440,
+        "h": saved_size[1] if saved_size else 320,
+    }
+
     # Silence harmless Qt warnings: the host-portal registration (custom app-id with no
     # installed .desktop) and the AT-SPI accessibility adaptor. We need neither.
     os.environ.setdefault("QT_ACCESSIBILITY", "0")
@@ -361,8 +372,6 @@ def main() -> int:
         _focus_window("hytale-tunnel")
         ui.raise_()
         ui.activateWindow()
-        ui.set_opened(True)                          # show the compose bar first (it's hidden
-                                                     # in passive HUD mode) so setFocus can land
         ui.input.setFocus()
         _set_enter_bind(False)                       # tunnel now focused -> Enter must submit
         _set_free_mouse(True)                        # cursor can roam the chat freely
@@ -375,7 +384,10 @@ def main() -> int:
     def _on_activation(active: bool) -> None:
         _set_free_mouse(active)
         _update_enter_bind()
+        changed = active != ui._opened
         ui.set_opened(active)                         # focused => full history; else => fading HUD
+        if LINUX and changed and not ui._collapsed:
+            _open_grow() if active else _close_shrink()   # taller when opened; short HUD when not
     ui.activation_changed.connect(_on_activation)
 
     # --- /friend: X25519 key-agreement handshake over the public /msg channel ---
@@ -455,10 +467,13 @@ def main() -> int:
         if toggle["pending"]:
             toggle["pending"] = False
             ui.toggle_collapsed()
-        if toggle["open"]:                   # Enter hotkey: focus the compose bar (expand first)
+        if toggle["open"]:                   # Enter/'\' hotkey: focus the compose bar
             toggle["open"] = False
-            ui.set_collapsed(False)
-            QtCore.QTimer.singleShot(120, _focus_overlay)
+            if ui._collapsed:                # from the pill: expand, then focus once it settles
+                ui.set_collapsed(False)
+                QtCore.QTimer.singleShot(120, _focus_overlay)
+            else:                            # already expanded (the usual case): focus NOW, no delay
+                _focus_overlay()
         if toggle["font"]:
             delta, toggle["font"] = toggle["font"], 0
             ui.bump_font(delta)
@@ -479,6 +494,30 @@ def main() -> int:
     timer = QtCore.QTimer()
     timer.timeout.connect(drain)
     timer.start(200)
+
+    # Make signal-driven hotkeys (SUPER+SHIFT+J collapse, the Enter/'\' quick-open, font
+    # resize) react the INSTANT the signal lands instead of waiting up to one 200ms drain
+    # tick -- that tick was why Enter felt laggy next to SUPER+SHIFT+P (which goes straight
+    # through hyprctl). Python writes the signal number to a self-pipe; a QSocketNotifier
+    # wakes the Qt loop and drains on the next turn (by which point the Python signal handler
+    # has set the toggle flag). The 200ms timer above stays as a belt-and-suspenders fallback.
+    _sig_socks = None
+    if LINUX and hasattr(signal, "set_wakeup_fd"):
+        _wsock, _rsock = socket.socketpair()
+        _wsock.setblocking(False)
+        _rsock.setblocking(False)
+        signal.set_wakeup_fd(_wsock.fileno())
+        _sig_notifier = QtCore.QSocketNotifier(
+            _rsock.fileno(), QtCore.QSocketNotifier.Type.Read)
+
+        def _on_signal_wakeup(*_) -> None:
+            try:
+                _rsock.recv(4096)                # clear the wake byte(s)
+            except OSError:
+                pass
+            QtCore.QTimer.singleShot(0, drain)   # flags are set by then; process immediately
+        _sig_notifier.activated.connect(_on_signal_wakeup)
+        _sig_socks = (_wsock, _rsock, _sig_notifier)   # keep alive for the app's lifetime
 
     def on_submit(text: str) -> None:
         text = text.strip()
@@ -591,17 +630,74 @@ def main() -> int:
     except OSError:
         pidfile = None
 
-    # Keep the overlay pinned top-right, including after a collapse/expand resize
-    # (Hyprland re-centers floating windows on resize, so re-apply each time).
-    # Fire a few times at increasing delays: Hyprland repositions the window itself
-    # during its resize animation, so the last (post-animation) placement must win.
-    def reposition() -> None:
-        for delay in (120, 400, 750):
-            QtCore.QTimer.singleShot(delay, lambda: _position_top_right(ui, app, saved_pos))
+    # Window sizing goes through Hyprland: it ignores a floating client's own resize()
+    # (honoring only size *hints*, which is why the pill's setFixedSize works but a plain
+    # resize doesn't), so we drive size with `resizewindowpixel` and then position with
+    # `movewindowpixel` -- the same compositor-side path we already use for moving.
+    _TOP_MARGIN = 8
+
+    def _apply_geo(x_rel: int, y_rel: int, w: int, h: int) -> None:
+        """Resize (Hyprland) + position (monitor-relative). Coords are monitor-relative,
+        like _query_geometry_linux / _position_top_right. Runs twice: the second pass is a
+        safety net for the moment just after a pill-expand, where Qt hasn't yet committed its
+        cleared min/max size hints and the first resize could otherwise be clamped."""
+        def go() -> None:
+            if LINUX:
+                subprocess.run(["hyprctl", "dispatch", "resizewindowpixel",
+                                f"exact {int(w)} {int(h)},class:^(hytale-tunnel)$"],
+                               capture_output=True)
+            else:
+                ui.resize(int(w), int(h))
+            _position_top_right(ui, app, (x_rel, y_rel))
+        for delay in (0, 150):
+            QtCore.QTimer.singleShot(delay, go)
+
+    def _sync_passive_geo() -> bool:
+        """Refresh passive_geo from the LIVE window (so dragging sticks). Returns True on
+        success. Call while the window is at its passive size (game-focused / just before
+        growing)."""
+        g = _query_geometry_linux() if LINUX else None
+        if g:
+            passive_geo.update(x=g[0], y=g[1], w=g[2], h=g[3])
+            return True
+        return False
+
+    def _open_grow() -> None:
+        """passive -> opened: grow ~2x taller, bottom-anchored from wherever it sits now."""
+        _sync_passive_geo()                          # anchor to the current (maybe dragged) spot
+        x, y = passive_geo["x"], passive_geo["y"]
+        w, h = passive_geo["w"], passive_geo["h"]
+        new_h = max(h, min(2 * h, y + h - _TOP_MARGIN))   # don't run off the monitor top
+        _apply_geo(x, y + h - new_h, w, new_h)       # keep the bottom fixed; top rises
+
+    def _close_shrink() -> None:
+        """opened -> passive: shrink back to the passive height, same bottom edge & x."""
+        g = _query_geometry_linux() if LINUX else None
+        if g:                                        # respect a drag done while opened
+            x, _, w, h = g
+            bottom = g[1] + g[3]
+        else:
+            x, w = passive_geo["x"], passive_geo["w"]
+            bottom = passive_geo["y"] + passive_geo["h"]
+        ph = passive_geo["h"]
+        y = max(0, bottom - ph)
+        passive_geo.update(x=x, y=y, w=w)            # remember the (possibly dragged) spot
+        _apply_geo(x, y, w, ph)
+
+    def _place_passive() -> None:
+        _apply_geo(passive_geo["x"], passive_geo["y"], passive_geo["w"], passive_geo["h"])
 
     def _on_collapsed_changed() -> None:
-        reposition()
         _update_enter_bind()                     # pill => Enter hotkey off; expanded => depends
+        if ui._collapsed:                        # pill sizes itself; just place it at the spot
+            for delay in (0, 130):
+                QtCore.QTimer.singleShot(delay,
+                                         lambda: _position_top_right(ui, app,
+                                                                     (passive_geo["x"], passive_geo["y"])))
+        elif ui._opened:                         # expanded straight into the focused state
+            _open_grow()
+        else:                                    # expanded into the passive HUD
+            _place_passive()
         if ui._collapsed:
             # collapsed back to the pill -> just drop the tunnel's focus; do NOT force the
             # game to the front (that yanks you back after switching desktops / minimizing).
@@ -622,11 +718,17 @@ def main() -> int:
         if ui._collapsed:
             return
         st = {"font_px": ui._font_px, "recipient": ui.recipient}
-        geo = _query_geometry_linux() if LINUX else (
-            lambda g: (g.x(), g.y(), g.width(), g.height()))(ui.frameGeometry())
+        # Only the PASSIVE HUD size/pos is the persisted base. While OPENED the window is
+        # grown ~2x taller, so don't capture that -- keep the last-known base geometry (but
+        # still persist font/recipient changes made while opened).
+        geo = None
+        if not ui._opened:
+            geo = _query_geometry_linux() if LINUX else (
+                lambda g: (g.x(), g.y(), g.width(), g.height()))(ui.frameGeometry())
         if geo:
             st["x"], st["y"], st["w"], st["h"] = geo
-        else:                                    # keep last-known geometry if unreadable
+            passive_geo.update(x=geo[0], y=geo[1], w=geo[2], h=geo[3])
+        else:                                    # keep last-known geometry if unreadable/opened
             for k in ("x", "y", "w", "h"):
                 if k in saved_state["last"]:
                     st[k] = saved_state["last"][k]
@@ -644,7 +746,7 @@ def main() -> int:
 
     scanner.start()
     ui.show()
-    reposition()
+    _place_passive()
 
     # Arm the Enter hotkey from whoever is actually focused right now, and re-check every
     # second so a direct game->other-app switch (no overlay focus event) can't leave Enter

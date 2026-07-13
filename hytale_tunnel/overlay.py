@@ -133,8 +133,18 @@ class Overlay(QtWidgets.QWidget):
         body = QtWidgets.QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(6)
+        # Scrollable full history -- shown only while OPENED (actively typing).
         self.view = QtWidgets.QTextEdit(readOnly=True)
         body.addWidget(self.view, 1)
+        # Passive HUD: a bottom-anchored stack of individually-fading lines shown while the
+        # game is focused (pure floating text, no chrome). Each line fades on its own timer.
+        self.hud = QtWidgets.QWidget()
+        self._hud_layout = QtWidgets.QVBoxLayout(self.hud)
+        self._hud_layout.setContentsMargins(4, 0, 4, 0)
+        self._hud_layout.setSpacing(2)
+        self._hud_layout.addStretch(1)           # pin lines to the bottom
+        self._hud_lines = []
+        body.addWidget(self.hud, 1)
         self.input = QtWidgets.QLineEdit()
         self.input.setPlaceholderText("Type your message here...")
         self.input.returnPressed.connect(self._on_submit)
@@ -143,22 +153,15 @@ class Overlay(QtWidgets.QWidget):
         self._apply_font()                       # size the transcript + input box
 
         # --- dynamic display ---
-        # Two modes while expanded: OPENED (focused via Enter) shows the full scrollable
-        # history + compose box; PASSIVE (expanded but focus is back on the game) is a HUD
-        # showing only the most recent lines, which fade out after a few idle seconds so an
-        # idle overlay becomes fully transparent. Driven by set_opened() from the app.
+        # Two modes while expanded: OPENED (focused via Enter / SUPER+SHIFT+P) shows the full
+        # scrollable history + compose box; PASSIVE (expanded but focus is back on the game) is
+        # a chrome-less HUD showing only the most recent lines, each of which fades out on its
+        # own timer so the overlay reads as floating chat over the game. Driven by set_opened().
         self._opened = False
-        self._fade = QtWidgets.QGraphicsOpacityEffect(self.view)
-        self._fade.setOpacity(1.0)
-        self.view.setGraphicsEffect(self._fade)
-        self._fade_anim = QtCore.QPropertyAnimation(self._fade, b"opacity", self)
-        self._fade_anim.setDuration(self._FADE_MS)
-        self._idle = QtCore.QTimer(self)
-        self._idle.setSingleShot(True)
-        self._idle.timeout.connect(self._start_fade)
+        self.hud.setVisible(False)
         self.input.setVisible(False)             # shown only when opened (focused)
+        self._sync_visibility()
 
-        QtGui.QShortcut(QtGui.QKeySequence("Esc"), self, activated=self._on_escape)
         # Focused-only fallbacks for font size (the global SUPER+SHIFT+± binds go
         # through Hyprland -> SIGRTMIN; these work when the overlay itself has focus).
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+="), self, activated=lambda: self.bump_font(1))
@@ -187,6 +190,8 @@ class Overlay(QtWidgets.QWidget):
             return
         self._font_px = new
         self._apply_font()
+        if not self._collapsed and not self._opened:
+            self._render_passive()               # rebuild HUD lines at the new size
         bar = self.view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
@@ -203,19 +208,20 @@ class Overlay(QtWidgets.QWidget):
     _C_SYS = "#888"           # server/console lines
 
     # ---- dynamic display tuning ----
-    _FADE_MS = 900          # fade-out animation length
-    _IDLE_MS = 8000         # passive: linger this long after the last line, then fade
-    _PASSIVE_MAX = 6        # passive HUD shows at most this many recent lines
+    _FADE_MS = 900          # per-line fade-out animation length
+    _LINGER_MS = 8000       # passive: each line stays fully visible this long, then fades
+    _PASSIVE_MAX = 8        # passive HUD keeps at most this many recent lines on screen
 
     def add_message(self, msg) -> None:
         """Store + render a chatframe.Msg, honoring the current display filter."""
         self._entries.append(("msg", msg))
-        if self._opened:
+        if self._collapsed:
+            pass                                 # pill: nothing to draw (unread badge below)
+        elif self._opened:
             if self._passes(msg):
                 self._append_html(self._format_message(msg))
-        else:
-            self._render_passive()               # HUD: last few lines, then fade
-            self._wake()
+        elif self._passes(msg):
+            self._hud_add(self._format_message(msg))   # own-timer fading HUD line
         if not msg.is_self:
             self._note_activity()
 
@@ -263,11 +269,12 @@ class Overlay(QtWidgets.QWidget):
 
     def add_system(self, text: str) -> None:
         self._entries.append(("sys", text))
+        if self._collapsed:
+            return
         if self._opened:
             self._append_html(self._format_system(text))
         else:
-            self._render_passive()
-            self._wake()
+            self._hud_add(self._format_system(text))
 
     def _format_system(self, text: str) -> str:
         return f'<span style="color:{self._C_SYS}">· {html.escape(text)}</span>'
@@ -275,45 +282,71 @@ class Overlay(QtWidgets.QWidget):
     # ---- opened (full history) vs passive (fading HUD) ----
 
     def set_opened(self, opened: bool) -> None:
-        """Switch display mode. opened=True (focused): full scrollable history + compose
-        box, no fade. opened=False (game focused): recent-lines HUD that fades when idle."""
+        """Switch display mode. opened=True (focused): full scrollable history + compose box
+        (and keyboard focus in the input, so you can type right away). opened=False (game
+        focused): a chrome-less HUD of recent lines that each fade out on their own timer."""
         if opened == self._opened:
             return
         self._opened = opened
-        self.input.setVisible(opened)
+        self._sync_visibility()
         if opened:
-            self._idle.stop()
-            self._fade_anim.stop()
-            self._fade.setOpacity(1.0)
             self._rebuild()                      # restore the full history
+            # The compose box was just shown; give it keyboard focus so SUPER+SHIFT+P /
+            # the Enter hotkey actually let you type (else you'd only *see* the box).
+            self.input.setFocus()
         else:
             self._render_passive()
-            self._wake()
+
+    def _sync_visibility(self) -> None:
+        """Show exactly the widgets the current collapsed/opened state calls for.
+        PASSIVE (expanded, game-focused) hides all chrome -> pure floating text."""
+        if self._collapsed:
+            self.header.setVisible(True)         # the pill itself lives in the header
+            self.body.setVisible(False)
+            self.arrow.setVisible(False)
+            for b in (self.filter_btn, self.emoji_btn, self.friends_btn):
+                b.setVisible(False)
+            return
+        chrome = self._opened
+        self.header.setVisible(chrome)           # passive -> no header/buttons
+        self.arrow.setVisible(chrome)
+        for b in (self.filter_btn, self.emoji_btn, self.friends_btn):
+            b.setVisible(chrome)
+        self.body.setVisible(True)
+        self.view.setVisible(self._opened)       # opened -> scrollable history
+        self.hud.setVisible(not self._opened)    # passive -> fading HUD
+        self.input.setVisible(self._opened)
+
+    # ---- passive HUD (individually-fading lines) ----
+
+    def _hud_add(self, html_text: str) -> None:
+        """Append one line to the passive HUD; it lingers, then fades on its own timer."""
+        line = _FadingLine(html_text, self._font_px, self._LINGER_MS,
+                           self._FADE_MS, self._hud_remove)
+        self._hud_lines.append(line)
+        self._hud_layout.addWidget(line)         # after the stretch => at the bottom
+        while len(self._hud_lines) > self._PASSIVE_MAX:
+            self._hud_lines.pop(0).kill()
+
+    def _hud_remove(self, line) -> None:
+        """A line finished fading (or is being culled): drop it from the HUD."""
+        if line in self._hud_lines:
+            self._hud_lines.remove(line)
+        line.kill()
+
+    def _hud_clear(self) -> None:
+        for line in self._hud_lines:
+            line.kill()
+        self._hud_lines = []
 
     def _render_passive(self) -> None:
-        """Redraw only the newest few visible lines (the passive HUD)."""
+        """Reseed the HUD with the most recent visible lines (each starts its own fade)."""
+        self._hud_clear()
         shown = [(k, p) for (k, p) in self._entries
                  if k == "sys" or self._passes(p)]
-        self.view.clear()
         for k, p in shown[-self._PASSIVE_MAX:]:
-            self.view.append(self._format_system(p) if k == "sys"
-                             else self._format_message(p))
-        bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-    def _wake(self) -> None:
-        """A new line arrived (passive mode): snap opaque and restart the idle countdown."""
-        self._fade_anim.stop()
-        self._fade.setOpacity(1.0)
-        self._idle.start(self._IDLE_MS)
-
-    def _start_fade(self) -> None:
-        if self._opened:
-            return
-        self._fade_anim.stop()
-        self._fade_anim.setStartValue(self._fade.opacity())
-        self._fade_anim.setEndValue(0.0)
-        self._fade_anim.start()
+            self._hud_add(self._format_system(p) if k == "sys"
+                          else self._format_message(p))
 
     # ---- display filter (cycled by the header button) ----
     # (key, short label). 'all' = everything; 'private' = party + whispers only;
@@ -335,7 +368,8 @@ class Overlay(QtWidgets.QWidget):
     def _cycle_filter(self) -> None:
         self._filter_idx = (self._filter_idx + 1) % len(self._FILTERS)
         self._update_filter_btn()
-        self._rebuild() if self._opened else self._render_passive()
+        if not self._collapsed:
+            self._rebuild() if self._opened else self._render_passive()
 
     def _update_filter_btn(self) -> None:
         self.filter_btn.setText(self._FILTERS[self._filter_idx][1])
@@ -374,14 +408,11 @@ class Overlay(QtWidgets.QWidget):
         if collapsed == self._collapsed:
             return
         self._collapsed = collapsed
-        self.body.setVisible(not collapsed)
-        self.arrow.setVisible(not collapsed)
-        self.filter_btn.setVisible(not collapsed)
-        self.emoji_btn.setVisible(not collapsed)
-        self.friends_btn.setVisible(not collapsed)
         if collapsed:
             self.title.setText("🔒 ▸")
             self.title.setStyleSheet(self._PILL_STYLE)
+            self._hud_clear()                    # stop any in-flight HUD fades
+            self._sync_visibility()
             # Force the size: equal min==max makes Hyprland/Windows honor the shrink
             # (a soft resize/adjustSize is otherwise ignored, leaving a frosted box).
             self.setFixedSize(132, 34)
@@ -392,8 +423,9 @@ class Overlay(QtWidgets.QWidget):
             self.setMinimumSize(0, 0)
             self.setMaximumSize(16777215, 16777215)
             self.resize(self._expanded_size)
-            self.input.setVisible(self._opened)  # compose bar only in the opened (focused) state
+            self._sync_visibility()              # compose/history only in the opened state
             if self._opened:
+                self._rebuild()
                 self.input.setFocus()
             else:
                 self._render_passive()           # HUD view until Enter/focus opens it
@@ -403,10 +435,6 @@ class Overlay(QtWidgets.QWidget):
 
     def toggle_collapsed(self) -> None:
         self.set_collapsed(not self._collapsed)
-
-    def _on_escape(self) -> None:
-        if not self._collapsed:
-            self.set_collapsed(True)
 
     def mousePressEvent(self, event) -> None:
         # Clicking the collapsed pill (or its title) restores the overlay.
@@ -465,6 +493,54 @@ class Overlay(QtWidgets.QWidget):
             self.submitted.emit(text)
         else:
             self.dismissed.emit()               # empty Enter -> hand focus back to the game
+
+
+class _FadingLine(QtWidgets.QLabel):
+    """One line in the passive HUD. It stays fully opaque for `linger_ms`, then fades to
+    nothing over `fade_ms` and calls `on_dead(self)` so the HUD can drop it. Each line runs
+    its own timer, so messages fade independently (not the whole transcript at once)."""
+
+    def __init__(self, html_text: str, font_px: int, linger_ms: int,
+                 fade_ms: int, on_dead) -> None:
+        super().__init__()
+        self._on_dead = on_dead
+        self.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.setText(html_text)
+        self.setWordWrap(True)
+        self.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.NoTextInteraction)
+        # Don't intercept the mouse -- the game keeps it while these float on top.
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet("background:transparent; color:#e6e6e6;"
+                           f"font-family:monospace; font-size:{font_px}px;")
+        self._eff = QtWidgets.QGraphicsOpacityEffect(self)
+        self._eff.setOpacity(1.0)
+        self.setGraphicsEffect(self._eff)
+        self._anim = QtCore.QPropertyAnimation(self._eff, b"opacity", self)
+        self._anim.setDuration(fade_ms)
+        self._anim.finished.connect(self._finished)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._begin_fade)
+        self._timer.start(linger_ms)
+
+    def _begin_fade(self) -> None:
+        self._anim.stop()
+        self._anim.setStartValue(self._eff.opacity())
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+
+    def _finished(self) -> None:
+        if self._eff.opacity() <= 0.01 and self._on_dead is not None:
+            cb, self._on_dead = self._on_dead, None
+            cb(self)
+
+    def kill(self) -> None:
+        """Stop timers/animation and remove the widget (idempotent)."""
+        self._on_dead = None
+        self._timer.stop()
+        self._anim.stop()
+        self.setParent(None)
+        self.deleteLater()
 
 
 class EmojiPicker(QtWidgets.QWidget):
