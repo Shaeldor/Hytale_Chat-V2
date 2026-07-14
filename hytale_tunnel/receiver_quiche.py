@@ -71,7 +71,8 @@ def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
     is_self = cl.kind == "whisper_out" or (bool(my_name) and cl.sender == my_name)
     sender = "you" if is_self else (cl.sender or cl.target or "?")
     colors = dict(rank=cl.rank, rank_color=cl.rank_color,
-                  name_color=cl.name_color, body_color=cl.body_color)
+                  name_color=cl.name_color, body_color=cl.body_color,
+                  name_runs=cl.name_runs, body_runs=cl.body_runs)
 
     m = chatframe.HX_TOKEN_RE.search(cl.body)
     if not m:                                   # plain chat -> show as-is
@@ -97,12 +98,10 @@ def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
     # The decrypted body is our own plaintext, not a game-rendered run -> no game
     # body colour for it (rank/name colour from the wire still applies).
     plain = out[1]
-    is_gif = plain.startswith(chatframe.GIF_SENTINEL)
-    gif_url = plain[len(chatframe.GIF_SENTINEL):].strip() if is_gif else ""
     return chatframe.Msg(sender=sender, body=plain, kind=cl.kind,
                          is_self=is_self, is_tunnel=True, target=cl.target,
                          rank=cl.rank, rank_color=cl.rank_color, name_color=cl.name_color,
-                         is_gif=is_gif, gif_url=gif_url)
+                         name_runs=cl.name_runs)   # sender-name colours apply; decrypted body has none
 
 
 def watch(on_message, stop=None, on_ready=None, proc_holder=None,
@@ -161,6 +160,10 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 # "name: " colon present, but no d2 signature) to learn the alt format.
                 if nsig == 0 and b"\x07#" in raw and b": " in raw:
                     _log("MISSHEX", raw.hex())
+                # Full hex of Discord-relay buffers, so a capture pins the exact framing of the
+                # (uncoloured) message text if it still shows empty.
+                if b"[Discord]" in raw:
+                    _log("DISCHEX", raw.hex())
             keyed = crypto.all_decrypt_keys()      # friend + party keys (re-read each buffer)
             for cl in lines:
                 # Rescue an encrypted party message hiding in an unclassified line before
@@ -176,7 +179,10 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 if tunnel_only and not msg.is_tunnel:
                     _log("DROP-tunnelonly", cl.kind, repr(msg.body[:40]))
                     continue
-                _log("EMIT", msg.kind, msg.sender, repr(msg.body[:80]))
+                # Log the per-run colour segments too (text + '#rrggbb') so a capture reveals the
+                # exact colours of markers like "[!]" -- what colour chat-filter rules need.
+                _runs = [(t[:16], c) for t, c in (msg.body_runs or [])][:10]
+                _log("EMIT", msg.kind, msg.sender, repr(msg.body[:80]), "runs=" + repr(_runs))
                 on_message(msg)
     finally:
         try:

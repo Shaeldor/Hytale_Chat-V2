@@ -9,17 +9,39 @@ This works identically on Linux/Hyprland and Windows.
 """
 
 import colorsys
-import hashlib
 import html
 import os
+import re
 import threading
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from . import emoji_util, gif_util
+from . import chatfilter, emoji_util, gif_util
+
+# A direct GIF/WebP URL anywhere in a message body -> render it inline as an animated GIF.
+_GIF_URL_RE = re.compile(r"https?://\S+\.(?:gif|webp)(?:\?\S*)?", re.IGNORECASE)
+
+# The compact placeholder shown in the compose box for a picked GIF (expands to its URL on
+# send, so a GIF mixes into any message -- "/msg Bo hey [GIF] gg", "/p sup [GIF]", or public).
+GIF_TOKEN = "[GIF]"
+_GIF_TOKEN_RE = re.compile(r"\[GIF\]")
+
+
+def _split_gifs(text: str):
+    """Split a message body into ('text', str) / ('gif', url) segments in order, so inline
+    .gif/.webp URLs can be rendered as animated GIFs and the surrounding text left as text."""
+    segs, i = [], 0
+    for m in _GIF_URL_RE.finditer(text):
+        if m.start() > i:
+            segs.append(("text", text[i:m.start()]))
+        segs.append(("gif", m.group(0)))
+        i = m.end()
+    if i < len(text):
+        segs.append(("text", text[i:]))
+    return segs
 
 # GIF display sizing (px, longest side): larger in the opened transcript, smaller in the
-# floating HUD so it's unobtrusive over the game.
+# floating HUD so it stays unobtrusive over the game. Rendered as real QMovie widgets.
 GIF_MAX_OPENED = 260
 GIF_MAX_HUD = 150
 
@@ -79,8 +101,7 @@ class Overlay(QtWidgets.QWidget):
     activation_changed = QtCore.pyqtSignal(bool)  # window gained (True) / lost (False) focus
     dismissed = QtCore.pyqtSignal()             # Enter pressed with empty input -> unfocus
     friend_action = QtCore.pyqtSignal(str, str)  # (action, name): add / accept / remove
-    gif_send = QtCore.pyqtSignal(str)           # a GIF url picked in the picker -> send it
-    gif_action = QtCore.pyqtSignal(str, str)    # (action, url): add / remove favorite
+    gif_action = QtCore.pyqtSignal(str, str)    # (action, url): add / unfav / forget favorite
     _gif_ready = QtCore.pyqtSignal(str)         # (url) a GIF finished downloading -> re-render
 
     def changeEvent(self, event) -> None:
@@ -98,12 +119,10 @@ class Overlay(QtWidgets.QWidget):
         self._filter_idx = 0
         self._font_px = font_px or FONT_SIZE_PX
         self._font_family = _norm_family(font_family)
-        self._gif_pumps = {}         # gif_id -> QMovie animating an <img> in the opened view
-        self._gif_placed = set()     # gif_ids whose <img> is currently in the opened view
         self._gif_pending = set()    # GIF urls currently downloading
-        self._hud_gif_by_url = {}    # url -> _FadingGif HUD line awaiting its download
         self._gif_picker = None
-        self._gif_ready.connect(self._on_gif_ready)
+        self._fill_gen = 0           # generation token so a stale incremental fill can be cancelled
+        self._pending_older = []     # older history entries still to be streamed into the opened view
         self._expanded_size = QtCore.QSize(*size) if size else QtCore.QSize(440, 320)
         self.setWindowTitle("hytale-tunnel")    # Hyprland matches this for window rules
         self.setWindowFlags(
@@ -162,6 +181,19 @@ class Overlay(QtWidgets.QWidget):
             " QPushButton:hover{background:rgba(44,49,60,150);}")
         self.gif_btn.clicked.connect(self._open_gif_picker)
         header.addWidget(self.gif_btn)
+        # Noise filter: opt-out toggles to hide spammy server chat (voting, join/leave,
+        # Discord ads, ...) plus your own starts/ends/contains string rules.
+        self.noise_btn = QtWidgets.QPushButton("🧹")
+        self.noise_btn.setToolTip("hide noisy server messages (voting, join/leave, Discord, custom…)")
+        self.noise_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.noise_btn.setStyleSheet(
+            "QPushButton{background:rgba(34,34,34,40);"
+            "border:1px solid rgba(58,65,80,70); border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
+        self.noise_btn.clicked.connect(self._open_noise_panel)
+        self._noise_panel = None
+        self._update_noise_btn()
+        header.addWidget(self.noise_btn)
         header.addStretch(1)
         self.arrow = QtWidgets.QLabel("→")
         header.addWidget(self.arrow)
@@ -187,9 +219,29 @@ class Overlay(QtWidgets.QWidget):
         body = QtWidgets.QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(6)
-        # Scrollable full history -- shown only while OPENED (actively typing).
-        self.view = QtWidgets.QTextEdit(readOnly=True)
+        # Scrollable full history -- shown only while OPENED (actively typing). A QScrollArea
+        # holding a bottom-anchored column of per-message WIDGETS (not a QTextEdit): GIFs are
+        # real QMovie labels that size correctly and never overlap the text, and long
+        # transcripts scroll normally. Text messages are word-wrapped QLabels.
+        self.view = QtWidgets.QScrollArea()
+        self.view.setWidgetResizable(True)
+        self.view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.view.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._transcript = QtWidgets.QWidget()
+        self._transcript.setObjectName("hx_transcript")   # so the shared bg targets ONLY this
+        self._tlayout = QtWidgets.QVBoxLayout(self._transcript)
+        self._tlayout.setContentsMargins(6, 4, 6, 4)
+        self._tlayout.setSpacing(3)
+        self._tlayout.addStretch(1)          # index 0: keeps messages hugging the bottom
+        self.view.setWidget(self._transcript)
         body.addWidget(self.view, 1)
+        # Follow new content to the bottom ONLY while the reader is already at the bottom (so
+        # scrolling up to read history isn't yanked back). We scroll on rangeChanged -- it fires
+        # exactly when the scroll range grows after a widget is added or a GIF finishes loading,
+        # by which point the new maximum is known (a deferred setValue would land short).
+        self._follow_bottom = True
+        self.view.verticalScrollBar().rangeChanged.connect(self._follow_range)
         # Passive HUD: a bottom-anchored stack of individually-fading lines shown while the
         # game is focused (pure floating text, no chrome). The lines sit inside ONE shared,
         # semi-transparent panel (not per-message bubbles) so they read as a single chat
@@ -243,10 +295,15 @@ class Overlay(QtWidgets.QWidget):
         """(Re)apply the current font family + size + transparency to the transcript + input."""
         in_alpha = min(235, BG_ALPHA + 70)      # compose box a touch more visible
         fam = _css_family(self._font_family)
-        self.view.setStyleSheet(
-            f"QTextEdit{{background:rgba(10,12,16,{BG_ALPHA}); color:#e6e6e6;"
-            "border:none; border-radius:6px; padding:4px;"
-            f"font-family:{fam}; font-size:{self._font_px}px;}}")
+        # ONE translucent rounded panel behind ALL messages (like the HUD's shared panel), not a
+        # box per message. The bg MUST be set DIRECTLY on the transcript widget (that auto-enables
+        # WA_StyledBackground so it actually paints -- a background in the QScrollArea's own
+        # stylesheet targeting a child never paints). The transcript fills the viewport via
+        # widgetResizable, the scroll area/viewport stay transparent, and message widgets paint none.
+        self.view.setStyleSheet("QScrollArea{border:none; background:transparent;}")
+        self.view.viewport().setStyleSheet("background:transparent;")
+        self._transcript.setStyleSheet(
+            f"#hx_transcript{{background:rgba(10,12,16,{BG_ALPHA}); border-radius:6px;}}")
         self.input.setStyleSheet(
             f"QLineEdit{{background:rgba(20,24,30,{in_alpha}); color:#fff;"
             "border:1px solid rgba(90,100,120,110); border-radius:6px; padding:5px;"
@@ -257,8 +314,8 @@ class Overlay(QtWidgets.QWidget):
         family (Qt still applies + falls back to a close match if not)."""
         self._font_family = _norm_family(name)
         self._apply_font()
-        if not self._collapsed and not self._opened:
-            self._render_passive()               # reseed HUD lines in the new font
+        if not self._collapsed:
+            self._rebuild() if self._opened else self._render_passive()   # re-render at new font
         if self._font_family.lower() in ("monospace", "serif", "sans-serif", "cursive", "fantasy"):
             return True                          # generics always resolve
         fams = QtGui.QFontDatabase.families()
@@ -276,10 +333,8 @@ class Overlay(QtWidgets.QWidget):
             return
         self._font_px = new
         self._apply_font()
-        if not self._collapsed and not self._opened:
-            self._render_passive()               # rebuild HUD lines at the new size
-        bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        if not self._collapsed:
+            self._rebuild() if self._opened else self._render_passive()   # re-render at new size
 
     # ---- public API (call from the Qt main thread only) ----
 
@@ -297,54 +352,95 @@ class Overlay(QtWidgets.QWidget):
     _FADE_MS = 900          # per-line fade-out animation length
     _LINGER_MS = 8000       # passive: each line stays fully visible this long, then fades
     _PASSIVE_MAX = 8        # passive HUD keeps at most this many recent lines on screen
+    _ENTRIES_MAX = 2000     # cap stored history (bounds memory on a spammy server)
+    _OPENED_MAX = 300       # opened view builds at most this many recent widgets (bounds the
+    #                         per-open cost -- rebuilding a widget for EVERY line ever seen is
+    #                         what made open/close get progressively slower)
+    _IMMEDIATE = 30         # of those, render this many synchronously on open (fills the view);
+    _FILL_BATCH = 50        # the rest stream in above, this many per 0ms tick, so typing is instant
+
+    def _record(self, entry) -> None:
+        """Append to the stored history, trimming the oldest beyond the cap."""
+        self._entries.append(entry)
+        if len(self._entries) > self._ENTRIES_MAX:
+            del self._entries[:len(self._entries) - self._ENTRIES_MAX]
 
     def add_message(self, msg) -> None:
         """Store + render a chatframe.Msg, honoring the current display filter."""
-        self._entries.append(("msg", msg))
+        self._record(("msg", msg))
         if self._collapsed:
             pass                                 # pill: nothing to draw (unread badge below)
         elif self._opened:
             if self._passes(msg):
-                if getattr(msg, "is_gif", False):
-                    self._append_gif_opened(msg)
-                else:
-                    self._append_html(self._format_message(msg))
+                self._append_widget(self._message_block(msg, GIF_MAX_OPENED, True))
         elif self._passes(msg):
-            if getattr(msg, "is_gif", False):
-                self._hud_add_gif(msg)           # animated GIF as a fading HUD line
-            else:
-                self._hud_add(self._format_message(msg))   # own-timer fading HUD line
+            self._hud_add_content(self._message_block(msg, GIF_MAX_HUD, False))
         if not msg.is_self:
             self._note_activity()
 
+    def _body_html(self, text: str) -> str:
+        """Render a message body to HTML for the caption/text line: text runs are emoji-expanded
+        + escaped; inline .gif/.webp URLs are DROPPED (the GIF renders as its own animated widget
+        below the text), so the raw URL never shows as text."""
+        out = []
+        for kind, seg in _split_gifs(text):
+            if kind == "text":
+                out.append(html.escape(emoji_util.emojize(seg)).replace("\n", "<br>"))
+        return "".join(out).strip()
+
+    def _runs_html(self, runs, drop_gifs: bool = False, bold: bool = False) -> str:
+        """Build HTML from the game's (text, '#rrggbb') colour segments, so a multi-colour name
+        or message keeps its per-character colours. Each segment is emoji-expanded + escaped and
+        wrapped in its own (brightened) colour; inline GIF URLs are dropped when `drop_gifs`."""
+        out = []
+        for text, color in runs:
+            pieces = _split_gifs(text) if drop_gifs else (("text", text),)
+            for kind, seg in pieces:
+                if kind == "gif":
+                    continue
+                h = html.escape(emoji_util.emojize(seg)).replace("\n", "<br>")
+                if not h:
+                    continue
+                c = _brighten(color) if color else ""
+                out.append(f'<span style="color:{c}">{h}</span>' if c else h)
+        s = "".join(out)
+        return f"<b>{s}</b>" if (bold and s) else s
+
     def _format_message(self, msg) -> str:
-        """Build the HTML line for a chatframe.Msg (no side effects)."""
+        """Build the HTML caption/text line for a chatframe.Msg (inline GIF URLs dropped -- they
+        become animated widgets alongside). No side effects."""
         name = html.escape(msg.sender)
-        # Expand emoji shortcodes/emoticons BEFORE escaping (glyphs are HTML-safe, and
-        # "<3" must be matched before "<" would become "&lt;"). Display-side only, so the
-        # encrypted wire keeps the compact shortcode.
-        body = html.escape(emoji_util.emojize(msg.body)).replace("\n", "<br>")
         lock = "🔒 " if msg.is_tunnel else ""
-        # Mirror the game's own colours where we have them (name / body are each
-        # independently coloured runs on the wire); fall back to our fixed palette
-        # for tunnel-decrypted or otherwise colourless lines. The rank tag itself is
-        # never shown -- we just borrow its colour for the name, so ranked players
-        # show up name-coloured without taking up extra width.
+        # BODY: reproduce the game's OWN per-run colours (multi-colour messages) when we have
+        # them (non-tunnel); else emoji-expand our text and apply the single flat body colour.
+        if not msg.is_tunnel and getattr(msg, "body_runs", None):
+            body = self._runs_html(msg.body_runs, drop_gifs=True)
+        else:
+            body = self._body_html(msg.body)
+            if not msg.is_self and msg.body_color and not msg.is_tunnel:
+                body = f'<span style="color:{_brighten(msg.body_color)}">{body}</span>'
+        # NAME single-colour fallback (used when the wire gave no per-run name segments).
         name_color = self._C_YOU if msg.is_self else (
             _brighten(msg.rank_color or msg.name_color)
             or (self._C_TUNNEL if msg.is_tunnel else self._C_OTHER))
-        if not msg.is_self and msg.body_color and not msg.is_tunnel:
-            body = f'<span style="color:{_brighten(msg.body_color)}">{body}</span>'
+
+        def colored_name() -> str:
+            """The sender name with the game's per-character colours, else a flat-coloured name."""
+            if not msg.is_self and getattr(msg, "name_runs", None):
+                inner = self._runs_html(msg.name_runs, bold=True)
+                if inner:
+                    return inner
+            return f'<span style="color:{name_color}"><b>{name}</b></span>'
 
         if msg.kind == "party":
-            who = "you" if msg.is_self else name
-            who_color = self._C_YOU if msg.is_self else self._C_PARTY
+            who = (f'<span style="color:{self._C_YOU}"><b>you</b></span>'
+                   if msg.is_self else colored_name())
             line = (f'<span style="color:{self._C_PARTY}">{lock}[P] </span>'
-                    f'<span style="color:{who_color}"><b>{html.escape(who)}:</b></span> {body}')
+                    f'{who}<span style="color:{self._C_DIM}">:</span> {body}')
         elif msg.kind == "emote":
             who = "you" if msg.is_self else name
             line = (f'<span style="color:{self._C_EMOTE}"><i>{lock}* '
-                    f'{html.escape(who)} {body}</i></span>')
+                    f'{html.escape(who)} {self._body_html(msg.body)}</i></span>')
         elif msg.kind == "whisper_in":
             line = (f'<span style="color:{self._C_WHISPER}">{lock}<b>{name}</b></span>'
                     f'<span style="color:{self._C_DIM}"> whispers:</span> {body}')
@@ -354,35 +450,37 @@ class Overlay(QtWidgets.QWidget):
                     f'<span style="color:{self._C_WHISPER}"><b>{tgt}</b></span>'
                     f'<span style="color:{self._C_DIM}">:</span> {body}')
         elif msg.kind == "system":
-            line = f'<span style="color:{self._C_SYS}">{body}</span>'
+            # Server/console lines are often multi-colour -> mirror their runs; grey fallback.
+            line = (self._runs_html(msg.body_runs, drop_gifs=True) if getattr(msg, "body_runs", None)
+                    else "") or f'<span style="color:{self._C_SYS}">{self._body_html(msg.body)}</span>'
         else:  # public
-            line = (f'<span style="color:{name_color}">{lock}<b>{name}:</b></span> {body}')
+            who = (f'<span style="color:{name_color}"><b>{name}</b></span>'
+                   if msg.is_self else colored_name())
+            line = f'{lock}{who}<span style="color:{self._C_DIM}">:</span> {body}'
         return line
 
     def add_system(self, text: str) -> None:
-        self._entries.append(("sys", text))
+        self._record(("sys", text))
         if self._collapsed:
             return
         if self._opened:
-            self._append_html(self._format_system(text))
+            self._append_widget(self._text_label(self._format_system(text), True))
         else:
-            self._hud_add(self._format_system(text))
+            self._hud_add_content(self._text_label(self._format_system(text), False))
 
     def _format_system(self, text: str) -> str:
         return f'<span style="color:{self._C_SYS}">· {html.escape(text)}</span>'
 
     # ---- GIF rendering ----
-    # A GIF message carries a URL (msg.gif_url). We download+cache it (gif_util, off-thread)
-    # and animate it: in the opened QTextEdit via an <img> whose pixmap a QMovie swaps each
-    # frame (text rendering untouched); in the passive HUD via a QLabel.setMovie (native).
-
-    @staticmethod
-    def _gif_id(url: str) -> str:
-        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    # A GIF is a direct .gif/.webp URL sitting INLINE in a message body. Both views render a
+    # message as a WIDGET: its text (caption + any words, GIF URLs dropped) as a QLabel, plus one
+    # animated QMovie label (_GifLabel) per inline GIF stacked below it. Real widgets size
+    # themselves, so a GIF never overlaps the text, and it animates in the passive HUD too.
 
     def _ensure_gif(self, url: str) -> bool:
         """Return True if the GIF is already cached; else kick off a background download and
-        return False (self._gif_ready fires when it lands, triggering a re-render)."""
+        return False (self._gif_ready fires with the url when it lands, so any _GifLabel waiting
+        on it can swap the animation in)."""
         if not url or gif_util.is_cached(url):
             return bool(url) and gif_util.is_cached(url)
         if url not in self._gif_pending:
@@ -390,27 +488,13 @@ class Overlay(QtWidgets.QWidget):
 
             def _work() -> None:
                 gif_util.fetch(url)
+                self._gif_pending.discard(url)
                 self._gif_ready.emit(url)        # queued back to the Qt thread
             threading.Thread(target=_work, daemon=True).start()
         return False
 
-    def _on_gif_ready(self, url: str) -> None:
-        # A GIF finished downloading. Update it IN PLACE (don't re-render the whole transcript
-        # -- that would reorder messages that arrived while it loaded, and reset every HUD
-        # fade). Opened: start the pump for its already-placed <img>. Passive: swap the movie
-        # into the loading HUD line that's already sitting in the right spot.
-        self._gif_pending.discard(url)
-        if self._collapsed:
-            return
-        if self._opened:
-            gid = self._gif_id(url)
-            if gid in self._gif_placed:
-                self._start_pump(gid, url)
-        else:
-            self._hud_gif_loaded(url)
-
     def _make_movie(self, url: str, max_px: int):
-        """A started, aspect-scaled QMovie for a cached GIF, or None."""
+        """A (not-yet-started) aspect-scaled QMovie for a cached GIF, or None."""
         mv = QtGui.QMovie(str(gif_util.cache_path(url)))
         if not mv.isValid():
             return None
@@ -421,87 +505,62 @@ class Overlay(QtWidgets.QWidget):
                                        QtCore.Qt.AspectRatioMode.KeepAspectRatio))
         return mv
 
-    def _clear_pumps(self) -> None:
-        for mv in self._gif_pumps.values():
-            mv.stop()
-        self._gif_pumps = {}
-        self._gif_placed = set()
+    def _text_label(self, html_text: str, selectable: bool) -> QtWidgets.QLabel:
+        """A word-wrapped RichText QLabel for a caption/text/system line in the current font."""
+        lbl = QtWidgets.QLabel(html_text)
+        lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        sp = lbl.sizePolicy()                    # advertise height-for-width so wrapped lines
+        sp.setHeightForWidth(True)               # get their full vertical space (no overlap)
+        sp.setVerticalPolicy(QtWidgets.QSizePolicy.Policy.Minimum)
+        lbl.setSizePolicy(sp)
+        lbl.setStyleSheet("background:transparent; color:#e6e6e6;"
+                          f"font-family:{_css_family(self._font_family)}; font-size:{self._font_px}px;")
+        if selectable:
+            lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        else:                                    # passive HUD: let the game keep the mouse
+            lbl.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.NoTextInteraction)
+        return lbl
 
-    def _gif_placeholder(self):
-        """A small 'loading' box used as the <img> resource until the GIF downloads, so the
-        image sits in the transcript in order and just gets its frames swapped in when ready."""
-        pm = QtGui.QPixmap(160, 90)
-        pm.fill(QtGui.QColor(20, 24, 30, 140))
-        p = QtGui.QPainter(pm)
-        p.setPen(QtGui.QColor("#9aa4b2"))
-        p.drawText(pm.rect(), int(QtCore.Qt.AlignmentFlag.AlignCenter), "🎞️ loading GIF…")
-        p.end()
-        return pm
+    def _message_block(self, msg, gif_max: int, selectable: bool) -> QtWidgets.QWidget:
+        """Build a message widget: the text/caption line, then an animated GIF label for each
+        inline .gif/.webp URL in the body (capped to `gif_max`)."""
+        text_lbl = self._text_label(self._format_message(msg), selectable)
+        gif_urls = _GIF_URL_RE.findall(msg.body or "")
+        if not gif_urls:
+            return text_lbl                          # common case: a bare label, no wrapper (fast)
+        w = QtWidgets.QWidget()
+        w.setStyleSheet("background:transparent;")   # no per-message box; the shared panel shows
+        if not selectable:
+            w.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        v.addWidget(text_lbl)
+        for url in gif_urls:
+            row = QtWidgets.QHBoxLayout()        # keep the GIF left-aligned, not stretched
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(_GifLabel(self, url, gif_max, self._font_px, self._font_family))
+            row.addStretch(1)
+            v.addLayout(row)
+        return w
 
-    def _start_pump(self, gid: str, url: str) -> None:
-        """Animate an <img src="gif://gid"> already in the opened QTextEdit by swapping its
-        image resource each QMovie frame. One relayout to size it to the gif, then per-frame
-        viewport repaints (constant size -> no more relayout)."""
-        if gid in self._gif_pumps:
-            return
-        mv = self._make_movie(url, GIF_MAX_OPENED)
-        if mv is None:
-            return
-        doc = self.view.document()
-        rtype = QtGui.QTextDocument.ResourceType.ImageResource
-        qurl = QtCore.QUrl(f"gif://{gid}")
+    def _stop_transcript_gifs(self) -> None:
+        """Pause every opened-transcript GIF (called when the view is hidden -> saves CPU; the
+        view is rebuilt, restarting them, when it's shown again)."""
+        for gl in self._transcript.findChildren(_GifLabel):
+            gl.stop()
 
-        def _on_frame(_i) -> None:
-            doc.addResource(rtype, qurl, mv.currentPixmap())
-            self.view.viewport().update()
-        doc.addResource(rtype, qurl, mv.currentPixmap())
-        doc.markContentsDirty(0, doc.characterCount())     # size the <img> to the gif (once)
-        mv.frameChanged.connect(_on_frame)
-        mv.start()
-        self._gif_pumps[gid] = mv
+    def _append_widget(self, w: QtWidgets.QWidget) -> None:
+        """Append a message/system widget to the transcript, following the newest only if the
+        reader is already at the bottom (else keep their scroll position)."""
+        self._follow_bottom = self._at_bottom()  # applied by _follow_range when the range grows
+        self._tlayout.addWidget(w)               # after the leading stretch -> bottom of the list
 
-    def _gif_caption(self, msg) -> str:
-        who = "you" if msg.is_self else html.escape(msg.sender)
-        colour = self._C_YOU if msg.is_self else self._C_WHISPER
-        return (f'🔒 <span style="color:{colour}"><b>{who}</b></span>'
-                f'<span style="color:{self._C_DIM}">:</span>')
-
-    def _append_gif_opened(self, msg) -> None:
-        # Place the <img> in order NOW (with a loading placeholder as its resource); animate in
-        # place when the download lands -- so messages that arrive meanwhile keep their order.
-        gid = self._gif_id(msg.gif_url)
-        self.view.document().addResource(
-            QtGui.QTextDocument.ResourceType.ImageResource,
-            QtCore.QUrl(f"gif://{gid}"), self._gif_placeholder())
-        self._append_html(self._gif_caption(msg) + f'<br><img src="gif://{gid}">')
-        self._gif_placed.add(gid)
-        if self._ensure_gif(msg.gif_url):            # already cached -> animate immediately
-            self._start_pump(gid, msg.gif_url)
-
-    def _hud_add_gif(self, msg) -> None:
-        """Add an animated GIF (with sender caption) as a fading HUD line. If it isn't cached
-        yet, show a 'loading' line in place and swap the movie in when it lands (no reseed)."""
-        line = _FadingGif(self._gif_caption(msg), self._font_px, self._font_family,
-                          self._LINGER_MS, self._FADE_MS, self._hud_remove)
-        if self._ensure_gif(msg.gif_url):
-            mv = self._make_movie(msg.gif_url, GIF_MAX_HUD)
-            if mv is not None:
-                line.set_movie(mv)
-        else:
-            self._hud_gif_by_url[msg.gif_url] = line   # fill it in when the download completes
-        self._hud_lines.append(line)
-        self._hud_layout.addWidget(line)
-        while len(self._hud_lines) > self._PASSIVE_MAX:
-            self._hud_lines.pop(0).kill()
-        self._hud_panel.setVisible(True)
-
-    def _hud_gif_loaded(self, url: str) -> None:
-        line = self._hud_gif_by_url.pop(url, None)
-        if line is None or line not in self._hud_lines:
-            return                                   # the line already faded away
-        mv = self._make_movie(url, GIF_MAX_HUD)
-        if mv is not None:
-            line.set_movie(mv)
+    def _follow_range(self, _lo: int, hi: int) -> None:
+        if self._follow_bottom:
+            self.view.verticalScrollBar().setValue(hi)
 
     # ---- opened (full history) vs passive (fading HUD) ----
 
@@ -514,12 +573,15 @@ class Overlay(QtWidgets.QWidget):
         self._opened = opened
         self._sync_visibility()
         if opened:
-            self._rebuild()                      # restore the full history
-            # The compose box was just shown; give it keyboard focus so SUPER+SHIFT+P /
-            # the Enter hotkey actually let you type (else you'd only *see* the box).
+            # Focus the compose box FIRST so you can type instantly -- don't make typing wait on
+            # rendering history. Then _rebuild() shows the last few lines immediately and streams
+            # the older ones in over the next event-loop ticks.
             self.input.setFocus()
+            self._rebuild()
         else:
-            self._clear_pumps()                  # stop opened-view GIF animations (view hidden)
+            self._cancel_fill()                  # stop any in-flight incremental history fill
+            self._stop_transcript_gifs()         # pause opened-view GIF animations (view hidden)
+            self.input.discard()                 # wipe leftover unsent text on unfocus
             self._render_passive()
 
     def _sync_visibility(self) -> None:
@@ -529,13 +591,13 @@ class Overlay(QtWidgets.QWidget):
             self.header.setVisible(True)         # the pill itself lives in the header
             self.body.setVisible(False)
             self.arrow.setVisible(False)
-            for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.friends_btn):
+            for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.noise_btn, self.friends_btn):
                 b.setVisible(False)
             return
         chrome = self._opened
         self.header.setVisible(chrome)           # passive -> no header/buttons
         self.arrow.setVisible(chrome)
-        for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.friends_btn):
+        for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.noise_btn, self.friends_btn):
             b.setVisible(chrome)
         self.body.setVisible(True)
         self.view.setVisible(self._opened)       # opened -> scrollable history
@@ -544,10 +606,10 @@ class Overlay(QtWidgets.QWidget):
 
     # ---- passive HUD (individually-fading lines) ----
 
-    def _hud_add(self, html_text: str) -> None:
-        """Append one line to the passive HUD; it lingers, then fades on its own timer."""
-        line = _FadingLine(html_text, self._font_px, self._LINGER_MS,
-                           self._FADE_MS, self._hud_remove, self._font_family)
+    def _hud_add_content(self, content: QtWidgets.QWidget) -> None:
+        """Wrap a content widget (text label or a message block with animated GIFs) in a
+        self-fading HUD line: it lingers, then fades out on its own timer."""
+        line = _FadingWrap(content, self._LINGER_MS, self._FADE_MS, self._hud_remove)
         self._hud_lines.append(line)
         self._hud_layout.addWidget(line)
         while len(self._hud_lines) > self._PASSIVE_MAX:
@@ -558,9 +620,6 @@ class Overlay(QtWidgets.QWidget):
         """A line finished fading (or is being culled): drop it from the HUD."""
         if line in self._hud_lines:
             self._hud_lines.remove(line)
-        for u, ln in list(self._hud_gif_by_url.items()):   # forget any pending-GIF ref to it
-            if ln is line:
-                del self._hud_gif_by_url[u]
         line.kill()
         if not self._hud_lines:                  # nothing left -> hide the shared panel
             self._hud_panel.setVisible(False)
@@ -569,7 +628,6 @@ class Overlay(QtWidgets.QWidget):
         for line in self._hud_lines:
             line.kill()
         self._hud_lines = []
-        self._hud_gif_by_url = {}
         self._hud_panel.setVisible(False)
 
     def _render_passive(self) -> None:
@@ -579,11 +637,9 @@ class Overlay(QtWidgets.QWidget):
                  if k == "sys" or self._passes(p)]
         for k, p in shown[-self._PASSIVE_MAX:]:
             if k == "sys":
-                self._hud_add(self._format_system(p))
-            elif getattr(p, "is_gif", False):
-                self._hud_add_gif(p)
+                self._hud_add_content(self._text_label(self._format_system(p), False))
             else:
-                self._hud_add(self._format_message(p))
+                self._hud_add_content(self._message_block(p, GIF_MAX_HUD, False))
 
     # ---- display filter (cycled by the header button) ----
     # (key, short label). 'all' = everything; 'private' = party + whispers only;
@@ -595,12 +651,26 @@ class Overlay(QtWidgets.QWidget):
     )
 
     def _passes(self, msg) -> bool:
+        # Opt-out noise filter: hide junk server/broadcast chat, but NEVER your own or encrypted
+        # (tunnel) messages -- so a DM/party line can't be swallowed by a rule. body_runs carries
+        # the per-run colours so a rule can match on colour (e.g. "[!]" whose "!" is orange).
+        # Real player chat (anything but a 'system' line) is only ever touched by a player-affecting
+        # category (welcome) -- so a player typing "vote now!" isn't hidden by the Voting filter.
+        if not msg.is_self and not msg.is_tunnel:
+            is_player = msg.kind != "system"
+            if chatfilter.should_hide(msg.body, getattr(msg, "body_runs", None), is_player):
+                return False
         key = self._FILTERS[self._filter_idx][0]
         if key == "private":
             return msg.kind in ("party", "whisper_in", "whisper_out")
         if key == "tunnel":
             return bool(msg.is_tunnel)
         return True
+
+    def _refresh_view(self) -> None:
+        """Re-render the current view (after a filter change)."""
+        if not self._collapsed:
+            self._rebuild() if self._opened else self._render_passive()
 
     def _cycle_filter(self) -> None:
         self._filter_idx = (self._filter_idx + 1) % len(self._FILTERS)
@@ -611,21 +681,50 @@ class Overlay(QtWidgets.QWidget):
     def _update_filter_btn(self) -> None:
         self.filter_btn.setText(self._FILTERS[self._filter_idx][1])
 
+    def _build_entry(self, entry) -> QtWidgets.QWidget:
+        kind, payload = entry
+        if kind == "sys":
+            return self._text_label(self._format_system(payload), True)
+        return self._message_block(payload, GIF_MAX_OPENED, True)
+
+    def _cancel_fill(self) -> None:
+        """Abandon any pending incremental history fill (bumping the generation invalidates it)."""
+        self._fill_gen += 1
+        self._pending_older = []
+
     def _rebuild(self) -> None:
-        """Re-render the whole transcript from stored entries under the current filter.
-        System/status lines always show; chat messages are filtered."""
-        self._clear_pumps()                          # stop old GIF animations before clearing
-        self.view.clear()
-        for kind, payload in self._entries:
-            if kind == "sys":
-                self.view.append(self._format_system(payload))
-            elif self._passes(payload):
-                if getattr(payload, "is_gif", False):
-                    self._append_gif_opened(payload)
-                else:
-                    self.view.append(self._format_message(payload))
-        bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        """Re-render the transcript under the current filter, but INCREMENTALLY: build the last
+        few lines synchronously (so the view is usable at once) and stream the older ones in over
+        the next event-loop ticks. System/status lines always show; chat messages are filtered."""
+        self._follow_bottom = True                   # a full rebuild ends scrolled to the newest
+        self._cancel_fill()
+        while self._tlayout.count() > 1:             # drop every widget except the leading stretch
+            item = self._tlayout.takeAt(1)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()                      # child QMovies stop when the label is destroyed
+        # Only build the most recent _OPENED_MAX; older history stays in _entries (for re-renders).
+        visible = [(k, p) for (k, p) in self._entries if k == "sys" or self._passes(p)]
+        visible = visible[-self._OPENED_MAX:]
+        immediate = visible[-self._IMMEDIATE:]       # shown right now (bottom of the view)
+        self._pending_older = visible[:-self._IMMEDIATE]   # streamed in above, newest-first
+        for entry in immediate:
+            self._tlayout.addWidget(self._build_entry(entry))
+        if self._pending_older:
+            gen = self._fill_gen
+            QtCore.QTimer.singleShot(0, lambda: self._fill_older(gen))
+
+    def _fill_older(self, gen: int) -> None:
+        """Insert a chunk of older history ABOVE what's shown (called off a 0ms timer so the UI
+        stays responsive). Newest-of-older first, so scrolling up reveals lines as they fill."""
+        if gen != self._fill_gen or not self._pending_older or not self._opened:
+            return
+        batch = self._pending_older[-self._FILL_BATCH:]
+        del self._pending_older[-self._FILL_BATCH:]
+        for entry in reversed(batch):                # insert each just under the stretch (index 1)
+            self._tlayout.insertWidget(1, self._build_entry(entry))
+        if self._pending_older:
+            QtCore.QTimer.singleShot(0, lambda: self._fill_older(gen))
 
     # ---- emoji picker ----
 
@@ -647,6 +746,23 @@ class Overlay(QtWidgets.QWidget):
         self._gif_picker.rebuild()
         self._gif_picker.popup(self.gif_btn)
 
+    # ---- noise filter (opt-out: hide spammy server chat) ----
+
+    def _open_noise_panel(self) -> None:
+        if self._noise_panel is None:
+            self._noise_panel = NoiseFilterPanel(self, self._on_noise_changed)
+        self._noise_panel.rebuild()
+        self._noise_panel.popup(self.noise_btn)
+
+    def _on_noise_changed(self) -> None:
+        """A category/custom rule was toggled or edited -> re-render + refresh the badge."""
+        self._update_noise_btn()
+        self._refresh_view()
+
+    def _update_noise_btn(self) -> None:
+        """Show a dot on the broom when at least one filter is actively hiding messages."""
+        self.noise_btn.setText("🧹●" if chatfilter.any_active() else "🧹")
+
     # ---- collapse / expand ----
 
     _PILL_STYLE = ("color:#8fd; font-weight:bold; background:rgba(20,24,30,235);"
@@ -661,7 +777,9 @@ class Overlay(QtWidgets.QWidget):
             self.title.setText("🔒 ▸")
             self.title.setStyleSheet(self._PILL_STYLE)
             self._hud_clear()                    # stop any in-flight HUD fades
-            self._clear_pumps()                  # stop opened-view GIF animations too
+            self._cancel_fill()                  # stop any in-flight incremental history fill
+            self._stop_transcript_gifs()         # pause opened-view GIF animations too
+            self.input.discard()                 # wipe leftover unsent text
             self._sync_visibility()
             # Force the size: equal min==max makes Hyprland/Windows honor the shrink
             # (a soft resize/adjustSize is otherwise ignored, leaving a frosted box).
@@ -731,10 +849,9 @@ class Overlay(QtWidgets.QWidget):
         else:
             self.friend_action.emit(action, name)
 
-    def _append_html(self, line: str) -> None:
-        self.view.append(line)
+    def _at_bottom(self) -> bool:
         bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        return bar.value() >= bar.maximum() - 4       # already scrolled to the newest
 
     def prefill(self, text: str) -> None:
         """Put `text` in the compose box with the cursor at the end (used by the '/' quick-
@@ -744,11 +861,19 @@ class Overlay(QtWidgets.QWidget):
         self.input.deselect()
         self.input.setFocus()
 
+    def insert_gif(self, url: str) -> None:
+        """Drop a compact '[GIF]' token (standing in for `url`) at the compose-box cursor. It
+        mixes into any message and expands to the URL on send -- so a GIF works in a private
+        '/msg <friend> hey [GIF]', a party '/p sup [GIF]', or a bare public line -- and renders
+        inline as the animated GIF (a compact [GIF] in the passive HUD)."""
+        self.input.insert_gif_token(url)
+        self.input.setFocus()
+
     def _on_submit(self) -> None:
-        text = self.input.text().strip()
+        text = self.input.expanded_text().strip()   # [GIF] tokens -> their real URLs
         if text:
             self.input.remember(text)           # add to the Up/Down recall history
-            self.input.clear()
+            self.input.discard()                # clear text + the pending-GIF map
             self.submitted.emit(text)
         else:
             self.dismissed.emit()               # empty Enter -> hand focus back to the game
@@ -766,6 +891,22 @@ class _ComposeEdit(QtWidgets.QLineEdit):
         self._history: list[str] = []   # submitted lines, oldest -> newest
         self._idx: int | None = None    # None = editing the live draft; else index in history
         self._draft = ""                # the draft saved when you start browsing up
+        self._gifs: list[str] = []      # URLs for the "[GIF]" tokens, in insertion order
+
+    def insert_gif_token(self, url: str) -> None:
+        """Insert a compact '[GIF]' placeholder at the cursor and remember its URL; expanded_text
+        swaps the placeholders back to their URLs (left-to-right) when the line is sent."""
+        self._gifs.append(url)
+        self.insert(GIF_TOKEN)
+
+    def expanded_text(self) -> str:
+        """The compose text with each '[GIF]' placeholder replaced (in order) by its saved URL.
+        A literally-typed '[GIF]' with no saved URL is left as-is (harmless plain text)."""
+        pending = list(self._gifs)
+
+        def _swap(_m):
+            return pending.pop(0) if pending else _m.group(0)
+        return _GIF_TOKEN_RE.sub(_swap, self.text())
 
     def remember(self, text: str) -> None:
         """Record a just-submitted line and reset the browse position to the draft."""
@@ -773,6 +914,14 @@ class _ComposeEdit(QtWidgets.QLineEdit):
             self._history.append(text)
         self._idx = None
         self._draft = ""
+
+    def discard(self) -> None:
+        """Wipe any unsent text + reset Up/Down browse state (on unfocus, so an old scramble
+        isn't sitting there next time) + the pending-GIF map. History is kept."""
+        self.clear()
+        self._idx = None
+        self._draft = ""
+        self._gifs = []
 
     def keyPressEvent(self, e) -> None:
         key = e.key()
@@ -808,32 +957,65 @@ class _ComposeEdit(QtWidgets.QLineEdit):
         self.end(False)                          # cursor to end, no selection
 
 
-class _FadingLine(QtWidgets.QLabel):
-    """One line in the passive HUD. It stays fully opaque for `linger_ms`, then fades to
-    nothing over `fade_ms` and calls `on_dead(self)` so the HUD can drop it. Each line runs
-    its own timer, so messages fade independently (not the whole transcript at once)."""
+class _GifLabel(QtWidgets.QLabel):
+    """Animates a cached GIF via QMovie. Until its URL finishes downloading it shows a small
+    'loading' note and swaps the animation in when the overlay's _gif_ready fires for that URL.
+    A real widget, so it sizes itself and never overlaps the surrounding text."""
 
-    def __init__(self, html_text: str, font_px: int, linger_ms: int,
-                 fade_ms: int, on_dead, font_family: str = "monospace") -> None:
+    def __init__(self, overlay, url: str, max_px: int, font_px: int, font_family: str) -> None:
+        super().__init__()
+        self._ov = overlay
+        self._url = url
+        self._max = max_px
+        # Passive-HUD GIFs must let the game keep the mouse; opened-view ones don't need it either.
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet("background:transparent; color:#7a828f;"
+                           f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
+        if gif_util.is_cached(url):
+            self._load()
+        else:
+            self.setText("🎞️ loading GIF…")
+            overlay._gif_ready.connect(self._on_ready)   # auto-disconnected if this label dies
+            overlay._ensure_gif(url)
+
+    def _on_ready(self, url: str) -> None:
+        if url != self._url:
+            return
+        try:
+            self._ov._gif_ready.disconnect(self._on_ready)
+        except (TypeError, RuntimeError):
+            pass
+        self._load()
+
+    def _load(self) -> None:
+        mv = self._ov._make_movie(self._url, self._max)
+        if mv is None:
+            self.setText("⚠ GIF failed to load")
+            return
+        self.setText("")
+        self.setMovie(mv)
+        mv.start()
+
+    def stop(self) -> None:
+        mv = self.movie()
+        if mv is not None:
+            mv.stop()
+
+
+class _FadingWrap(QtWidgets.QWidget):
+    """One line in the passive HUD: holds a content widget (a text QLabel, or a message block
+    with animated GIF labels), stays fully opaque for `linger_ms`, then fades to nothing over
+    `fade_ms` and calls `on_dead(self)`. Each line runs its own timer so lines fade independently."""
+
+    def __init__(self, content: QtWidgets.QWidget, linger_ms: int, fade_ms: int, on_dead) -> None:
         super().__init__()
         self._on_dead = on_dead
-        self.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self.setWordWrap(True)
-        # A word-wrapped QLabel must advertise height-for-width, else a layout gives it a
-        # one-line height and a 3-line message overlaps the line below it. Force it so wrapped
-        # lines get their full vertical space.
-        sp = self.sizePolicy()
-        sp.setHeightForWidth(True)
-        sp.setVerticalPolicy(QtWidgets.QSizePolicy.Policy.Minimum)
-        self.setSizePolicy(sp)
-        self.setText(html_text)
-        self.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.NoTextInteraction)
-        # Don't intercept the mouse -- the game keeps it while these float on top.
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        # Transparent: the shared HUD panel behind the lines provides the background, so the
-        # messages read as one block rather than separate per-message boxes.
-        self.setStyleSheet("background: transparent; color:#e6e6e6;"
-                           f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
+        self.setStyleSheet("background:transparent;")   # shared HUD panel shows, no per-line box
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 1, 0, 1)
+        lay.setSpacing(0)
+        lay.addWidget(content)
         self._eff = QtWidgets.QGraphicsOpacityEffect(self)
         self._eff.setOpacity(1.0)
         self.setGraphicsEffect(self._eff)
@@ -861,70 +1043,8 @@ class _FadingLine(QtWidgets.QLabel):
         self._on_dead = None
         self._timer.stop()
         self._anim.stop()
-        mv = self.movie()                        # a GIF line: stop its animation too
-        if mv is not None:
-            mv.stop()
-        self.setParent(None)
-        self.deleteLater()
-
-
-class _FadingGif(QtWidgets.QWidget):
-    """A HUD line for a GIF: a sender caption above the animated GIF (or a 'loading' note
-    until it downloads), fading on its own timer just like _FadingLine. Kept as a small
-    composite (caption + gif labels) because a single QLabel can't show both text and a movie."""
-
-    def __init__(self, caption_html: str, font_px: int, font_family: str,
-                 linger_ms: int, fade_ms: int, on_dead) -> None:
-        super().__init__()
-        self._on_dead = on_dead
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 1, 0, 1)
-        v.setSpacing(1)
-        self._cap = QtWidgets.QLabel(caption_html)
-        self._cap.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self._cap.setWordWrap(True)
-        self._cap.setStyleSheet("background:transparent; color:#e6e6e6;"
-                                f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
-        self._gif = QtWidgets.QLabel("🎞️ loading GIF…")
-        self._gif.setStyleSheet("background:transparent; color:#7a828f;"
-                                f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
-        v.addWidget(self._cap)
-        v.addWidget(self._gif)
-        self._eff = QtWidgets.QGraphicsOpacityEffect(self)
-        self._eff.setOpacity(1.0)
-        self.setGraphicsEffect(self._eff)
-        self._anim = QtCore.QPropertyAnimation(self._eff, b"opacity", self)
-        self._anim.setDuration(fade_ms)
-        self._anim.finished.connect(self._finished)
-        self._timer = QtCore.QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self._begin_fade)
-        self._timer.start(linger_ms)
-
-    def set_movie(self, mv) -> None:
-        self._gif.setText("")
-        self._gif.setMovie(mv)
-        mv.start()
-
-    def _begin_fade(self) -> None:
-        self._anim.stop()
-        self._anim.setStartValue(self._eff.opacity())
-        self._anim.setEndValue(0.0)
-        self._anim.start()
-
-    def _finished(self) -> None:
-        if self._eff.opacity() <= 0.01 and self._on_dead is not None:
-            cb, self._on_dead = self._on_dead, None
-            cb(self)
-
-    def kill(self) -> None:
-        self._on_dead = None
-        self._timer.stop()
-        self._anim.stop()
-        mv = self._gif.movie()
-        if mv is not None:
-            mv.stop()
+        for gl in self.findChildren(_GifLabel):   # stop any animating GIFs on this line
+            gl.stop()
         self.setParent(None)
         self.deleteLater()
 
@@ -1137,8 +1257,9 @@ class FriendsPanel(QtWidgets.QWidget):
 
 class GifPicker(QtWidgets.QWidget):
     """Popup GIF library: save GIFs by pasting a direct URL, browse your favorites +
-    recents as thumbnails, click one to send it (encrypted) to the current recipient,
-    or ✕ to remove a favorite. No search service -- purely your own saved GIFs."""
+    recents as thumbnails, click one to drop a '[GIF]' token into the compose box (mix it
+    into any /msg, /p, or public line), or ✕ to delete it. No search service -- purely your
+    own saved GIFs."""
 
     _COLS = 3
     _THUMB = 96
@@ -1213,7 +1334,7 @@ class GifPicker(QtWidgets.QWidget):
                 urls.append(u)
         for i, url in enumerate(urls):
             self.grid.addWidget(self._tile(url), i // self._COLS, i % self._COLS)
-        self._hint.setText("click a GIF to send · ✕ removes a favorite"
+        self._hint.setText("click a GIF → drops [GIF] in the compose box · ✕ deletes"
                            if urls else "no GIFs yet — paste a direct .gif URL above")
 
     def _tile(self, url: str) -> QtWidgets.QWidget:
@@ -1223,7 +1344,7 @@ class GifPicker(QtWidgets.QWidget):
         v.setSpacing(1)
         thumb = QtWidgets.QToolButton()
         thumb.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        thumb.setToolTip("send this GIF")
+        thumb.setToolTip("put this GIF in the compose box")
         thumb.setFixedSize(self._THUMB, self._THUMB)
         thumb.setStyleSheet("QToolButton{border:1px solid #2a2f3a; border-radius:6px;"
                             "background:rgba(10,12,16,160);}"
@@ -1263,7 +1384,7 @@ class GifPicker(QtWidgets.QWidget):
         return w
 
     def _send(self, url: str) -> None:
-        self._ov.gif_send.emit(url)
+        self._ov.insert_gif(url)          # into the compose box, not an instant send
         self.close()
 
     def _toggle_fav(self, url: str, is_fav: bool) -> None:
@@ -1280,3 +1401,164 @@ class GifPicker(QtWidgets.QWidget):
         self.show()
         self.raise_()
         self.url.setFocus()
+
+
+class NoiseFilterPanel(QtWidgets.QWidget):
+    """Popup 'hide noise' panel: opt-out checkboxes for spammy server-chat categories (voting,
+    join/leave, deaths, Discord ads, ...) plus custom starts/ends/contains string rules. Edits
+    go straight to chatfilter (persisted); `on_changed()` re-renders the transcript."""
+
+    _MODE_LABELS = {"contains": "contains", "startswith": "starts with", "endswith": "ends with",
+                    "number": "is a number"}
+
+    def __init__(self, overlay, on_changed):
+        super().__init__(overlay, QtCore.Qt.WindowType.Popup)
+        self._on_changed = on_changed
+        self.setStyleSheet("background:rgba(18,21,27,245);"
+                           "border:1px solid #3a4150; border-radius:8px;")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        head = QtWidgets.QLabel("Hide noisy messages  ·  everything shows unless ticked")
+        head.setStyleSheet("color:#8fd; font-weight:bold; font-size:11px;")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self._host = QtWidgets.QWidget()
+        self.rows = QtWidgets.QVBoxLayout(self._host)
+        self.rows.setSpacing(2)
+        self.rows.setContentsMargins(0, 0, 0, 0)
+        self.rows.addStretch(1)
+        self.scroll.setWidget(self._host)
+        lay.addWidget(self.scroll, 1)
+
+        add = QtWidgets.QHBoxLayout()
+        add.setSpacing(4)
+        self.custom_in = QtWidgets.QLineEdit()
+        self.custom_in.setPlaceholderText("custom text to hide…")
+        self.custom_in.setStyleSheet(
+            "QLineEdit{background:rgba(10,12,16,220); color:#fff;"
+            "border:1px solid #3a4150; border-radius:6px; padding:4px;}")
+        self.custom_in.returnPressed.connect(self._add_custom)
+        add.addWidget(self.custom_in, 1)
+        self.mode_sel = QtWidgets.QComboBox()
+        for m in chatfilter.MODES:
+            self.mode_sel.addItem(self._MODE_LABELS[m], m)
+        self.mode_sel.setStyleSheet(
+            "QComboBox{color:#ddd; background:rgba(10,12,16,220);"
+            "border:1px solid #3a4150; border-radius:6px; padding:3px 6px;}")
+        add.addWidget(self.mode_sel)
+        addbtn = QtWidgets.QPushButton("add")
+        addbtn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        addbtn.setStyleSheet(
+            "QPushButton{color:#9bf6a0; background:rgba(34,40,34,120);"
+            "border:1px solid #3a4150; border-radius:6px; padding:4px 10px;}"
+            " QPushButton:hover{background:rgba(44,60,44,180);}")
+        addbtn.clicked.connect(self._add_custom)
+        add.addWidget(addbtn)
+        lay.addLayout(add)
+
+        self.setFixedSize(320, 420)
+
+    # ---- build ----
+
+    def _clear_rows(self) -> None:
+        while self.rows.count() > 1:                   # keep the trailing stretch
+            item = self.rows.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def rebuild(self) -> None:
+        self._clear_rows()
+        idx = 0
+        for cid, label, _pats in chatfilter.CATEGORIES:
+            self.rows.insertWidget(idx, self._category_row(cid, label)); idx += 1
+        custom = chatfilter.custom_rules()
+        if custom:
+            sep = QtWidgets.QLabel("custom rules")
+            sep.setStyleSheet("color:#7a828f; font-size:10px; padding-top:4px;")
+            self.rows.insertWidget(idx, sep); idx += 1
+        for i, rule in enumerate(custom):
+            self.rows.insertWidget(idx, self._custom_row(i, rule)); idx += 1
+
+    def _checkbox(self, text: str, checked: bool) -> QtWidgets.QCheckBox:
+        cb = QtWidgets.QCheckBox(text)
+        cb.setChecked(checked)
+        cb.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        cb.setStyleSheet("QCheckBox{color:#ddd; padding:2px;} "
+                         "QCheckBox::indicator{width:14px; height:14px;}")
+        return cb
+
+    def _category_row(self, cid: str, label: str) -> QtWidgets.QWidget:
+        cb = self._checkbox(label, chatfilter.category_hidden(cid))
+        cb.setToolTip(f"hide {label} messages")
+        cb.toggled.connect(lambda on, c=cid: self._set_cat(c, on))
+        return cb
+
+    def _custom_row(self, index: int, rule: dict) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0); h.setSpacing(4)
+        cb = self._checkbox("", rule["on"])
+        cb.toggled.connect(lambda on, i=index: self._toggle_custom(i, on))
+        h.addWidget(cb)
+        # Delete (✕) + mode first, pinned to the right at their natural size, so a long rule text
+        # can never push them off the (fixed-width) panel. The text label then WRAPS into whatever
+        # width is left instead of overflowing horizontally (there's no horizontal scrollbar).
+        rm = QtWidgets.QPushButton("✕")
+        rm.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        rm.setToolTip("delete this rule")
+        rm.setStyleSheet("QPushButton{color:#ff8f8f; background:transparent; border:none;"
+                         "padding:2px 6px;} QPushButton:hover{color:#fff;}")
+        rm.clicked.connect(lambda _=False, i=index: self._remove_custom(i))
+        mode = QtWidgets.QLabel(self._MODE_LABELS[rule["mode"]])
+        mode.setStyleSheet("color:#7a828f; font-size:10px;")
+        lbl = QtWidgets.QLabel(f'“{html.escape(rule["text"])}”')
+        lbl.setStyleSheet("color:#e6e6e6;")
+        lbl.setToolTip(f'{rule["text"]} · {self._MODE_LABELS[rule["mode"]]}')
+        lbl.setWordWrap(True)                        # long rules wrap instead of overflowing
+        sp = lbl.sizePolicy()
+        sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Policy.Ignored)   # take given width, don't demand its own
+        sp.setHeightForWidth(True)
+        lbl.setSizePolicy(sp)
+        h.addWidget(lbl, 1)
+        h.addWidget(mode)
+        h.addWidget(rm)
+        h.setAlignment(rm, QtCore.Qt.AlignmentFlag.AlignTop)
+        h.setAlignment(mode, QtCore.Qt.AlignmentFlag.AlignTop)
+        return row
+
+    # ---- actions (persist via chatfilter, then re-render) ----
+
+    def _set_cat(self, cid: str, on: bool) -> None:
+        chatfilter.set_category(cid, on)
+        self._on_changed()
+
+    def _toggle_custom(self, index: int, on: bool) -> None:
+        chatfilter.toggle_custom(index, on)
+        self._on_changed()
+
+    def _remove_custom(self, index: int) -> None:
+        chatfilter.remove_custom(index)
+        self.rebuild()
+        self._on_changed()
+
+    def _add_custom(self) -> None:
+        text = self.custom_in.text().strip()
+        if not text:
+            return
+        if chatfilter.add_custom(text, self.mode_sel.currentData()):
+            self.custom_in.clear()
+            self.rebuild()
+            self._on_changed()
+
+    def popup(self, anchor) -> None:
+        gp = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + 4))
+        self.move(gp)
+        self.show()
+        self.raise_()

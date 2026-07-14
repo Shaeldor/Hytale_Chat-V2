@@ -24,7 +24,7 @@ CATEGORIES (from real traffic)
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Chat-log message type signature: header[4]==0xd2, header[8]==0x01, header[10]==0x40.
 TYPE_OFF, TYPE_B = 4, 0xD2
@@ -36,10 +36,16 @@ _RUN = re.compile(rb"\x07#([0-9a-fA-F]{6})")
 # An encrypted tunnel token embedded in a message body (single 'HX1' or chunk 'HX2').
 HX_TOKEN_RE = re.compile(r"HX[12][A-Za-z0-9+/=]{20,}")
 
-# Sentinel that marks a decrypted message as a GIF: the plaintext is "HXG1 <url>".
-# It lives INSIDE the encrypted payload, so it's only trusted on the E2E-decrypted path
-# (a GIF is just a URL sent as a normal encrypted message; overlay downloads + animates it).
-GIF_SENTINEL = "HXG1 "
+# Direct GIF/WebP URLs embedded ANYWHERE in a message body. A GIF is just such a URL sitting
+# inline in the (decrypted, for /msg /p) text; the overlay finds it by extension and animates
+# it in place, showing a compact "[GIF]" in the transcript. Used here only to note sent GIFs as
+# recents; the overlay owns the actual inline rendering.
+_GIF_URL_RE = re.compile(r"https?://\S+\.(?:gif|webp)(?:\?\S*)?", re.IGNORECASE)
+
+
+def gif_urls_in(text: str) -> list:
+    """Every direct .gif/.webp URL appearing in `text` (in order)."""
+    return _GIF_URL_RE.findall(text or "")
 
 # Line classifiers (applied to the reconstructed text).
 _RE_WHISPER_OUT = re.compile(r"^\[To (\S+)\] (.*)$", re.DOTALL)
@@ -73,6 +79,21 @@ def sender_before_token(full: str, before: int) -> str:
     return best
 
 
+def _slice_runs(runs: list[tuple[str, str]], start: int, end: int) -> list:
+    """The (text, '#rrggbb') colour segments covering [start, end) of the concatenated run
+    text, splitting runs at the boundaries. Lets the overlay reproduce the game's per-CHARACTER
+    colouring within a name or body (a single flat colour loses multi-colour names/messages)."""
+    out = []
+    cum = 0
+    for text, color in runs:
+        rs, re_ = cum, cum + len(text)
+        cum = re_
+        a, b = max(rs, start), min(re_, end)
+        if a < b:
+            out.append((text[a - rs:b - rs], ("#" + color) if color else ""))
+    return out
+
+
 def _color_at(runs: list[tuple[str, str]], pos: int) -> str:
     """Colour (as '#rrggbb') of the run covering offset `pos` in the concatenated
     run text, or '' if out of range. Lets us reuse the game's OWN per-run colours
@@ -84,7 +105,7 @@ def _color_at(runs: list[tuple[str, str]], pos: int) -> str:
     for text, color in runs:
         end = cum + len(text)
         if cum <= pos < end:
-            return "#" + color
+            return ("#" + color) if color else ""
         cum = end
     return ""
 
@@ -137,6 +158,7 @@ def parse_runs(raw: bytes) -> list[tuple[str, str]]:
     tails of long runs -> 'missing the first words' and dropped >=128-byte runs).
     """
     runs: list[tuple[str, str]] = []
+    last_end = 0
     for m in _RUN.finditer(raw):
         color = m.group(1).decode()
         end = m.start()
@@ -151,7 +173,45 @@ def parse_runs(raw: bytes) -> list[tuple[str, str]]:
                 textfield = raw[end - declared:end]
         text = _strip_len_prefix(textfield)
         runs.append((text.decode("utf-8", "replace"), color))
+        last_end = m.end()
+    # Recover a trailing UNCOLOURED text field. A colour tag is "\x07#rrggbb"; an uncoloured field
+    # -- notably a Discord relay's message body ("[Discord] <name>: <message>") -- is instead stored
+    # as a lone "\x07" directly followed by the raw text, running to the end of the frame (no colour,
+    # no length prefix). The colour-tag loop above misses it, so the message renders EMPTY. Recover
+    # the first such "\x07<text>" after the last colour tag. Only augment lines that already have
+    # colour runs (real chat) so a binary/spurious-signature segment is never resurrected as text.
+    if runs:
+        p = raw.find(_FF8, last_end)             # the 0xff anchor before the uncoloured message
+        if p >= 0:
+            e = p
+            while e < len(raw) and raw[e] == 0xff:   # skip the whole 0xff run
+                e += 1
+            text = _read_len_prefixed(raw[e:]).decode("utf-8", "replace")
+            if (text.strip() and len(text) <= 4096
+                    and text.count("�") <= 2    # reject decode-garbage (binary read as text)
+                    and _printable_ratio(text) >= 0.9):
+                runs.append((text, ""))          # '' colour -> rendered in the default text colour
     return runs
+
+
+def _read_len_prefixed(tf: bytes) -> bytes:
+    """Read a 7-bit varint length then return EXACTLY that many following bytes (a self-bounded
+    textfield -- unlike _strip_len_prefix which returns everything after the varint)."""
+    n = shift = i = 0
+    while i < len(tf):
+        b = tf[i]
+        n |= (b & 0x7F) << shift
+        i += 1
+        if b < 0x80:
+            break
+        shift += 7
+        if shift > 21:
+            return b""
+    return tf[i:i + n]
+
+
+def _printable_ratio(s: str) -> float:
+    return sum(c.isprintable() or c in "\n\t " for c in s) / len(s) if s else 0.0
 
 
 @dataclass
@@ -165,6 +225,10 @@ class ChatLine:
     rank_color: str = ""    # game's own colour for the rank tag ('' if unknown)
     name_color: str = ""    # game's own colour for the sender name ('' if unknown)
     body_color: str = ""    # game's own colour for the message body ('' if unknown)
+    # Full per-run colour segments so the overlay can mirror MULTI-colour names/bodies (and
+    # colour system lines) exactly, not just a single flat colour. Each is [(text, '#rrggbb'), …].
+    name_runs: list = field(default_factory=list)
+    body_runs: list = field(default_factory=list)
 
     @property
     def is_player(self) -> bool:
@@ -179,33 +243,46 @@ def classify(full: str, runs: list[tuple[str, str]] | None = None) -> ChatLine:
     mirror in-game rank/message colouring exactly instead of guessing.
     """
     runs = runs or []
+    end = len(full)
 
     def color_for(m, group) -> str:
         return _color_at(runs, m.start(group)) if m.group(group) else ""
 
+    def name_seg(m, group):                              # colour segments of a name span
+        return _slice_runs(runs, m.start(group), m.end(group)) if m.group(group) else []
+
+    def body_seg(m, group):                              # colour segments from body start -> EOL
+        return _slice_runs(runs, m.start(group), end) if m.group(group) else []
+
     m = _RE_WHISPER_OUT.match(full)
     if m:
         return ChatLine("whisper_out", "", m.group(2), full, target=m.group(1),
-                         body_color=color_for(m, 2))
+                         body_color=color_for(m, 2), body_runs=body_seg(m, 2))
     m = _RE_WHISPER_IN.match(full)
     if m:
         return ChatLine("whisper_in", m.group(1), m.group(2), full,
-                         name_color=color_for(m, 1), body_color=color_for(m, 2))
+                         name_color=color_for(m, 1), body_color=color_for(m, 2),
+                         name_runs=name_seg(m, 1), body_runs=body_seg(m, 2))
     m = _RE_PARTY.match(full)
     if m:
         return ChatLine("party", m.group(2), m.group(3), full,
                          rank=m.group(1) or "", rank_color=color_for(m, 1),
-                         name_color=color_for(m, 2), body_color=color_for(m, 3))
+                         name_color=color_for(m, 2), body_color=color_for(m, 3),
+                         name_runs=name_seg(m, 2), body_runs=body_seg(m, 3))
     m = _RE_PUBLIC.match(full)
     if m:
         return ChatLine("public", m.group(2), m.group(3), full,
                          rank=m.group(1) or "", rank_color=color_for(m, 1),
-                         name_color=color_for(m, 2), body_color=color_for(m, 3))
+                         name_color=color_for(m, 2), body_color=color_for(m, 3),
+                         name_runs=name_seg(m, 2), body_runs=body_seg(m, 3))
     m = _RE_EMOTE.match(full)
     if m:
         return ChatLine("emote", m.group(1), m.group(2), full,
-                         name_color=color_for(m, 1), body_color=color_for(m, 2))
-    return ChatLine("system", "", full, full)
+                         name_color=color_for(m, 1), body_color=color_for(m, 2),
+                         name_runs=name_seg(m, 1), body_runs=body_seg(m, 2))
+    # system: colour the WHOLE line from its own runs (server messages are often multi-colour;
+    # showing them flat grey loses that).
+    return ChatLine("system", "", full, full, body_runs=_slice_runs(runs, 0, end))
 
 
 def parse(raw: bytes) -> ChatLine | None:
@@ -262,5 +339,7 @@ class Msg:
     rank_color: str = ""      # game's own colour for the rank tag ('' if unknown)
     name_color: str = ""      # game's own colour for the sender name ('' if unknown)
     body_color: str = ""      # game's own colour for the message body ('' if unknown)
-    is_gif: bool = False      # a GIF message -> render the animated GIF at gif_url
-    gif_url: str = ""         # the GIF's URL (also kept in body for old-client fallback)
+    # Per-run colour segments [(text, '#rrggbb'), …] for multi-colour names/bodies + system
+    # lines (empty -> fall back to the flat colours above / our palette).
+    name_runs: list = field(default_factory=list)
+    body_runs: list = field(default_factory=list)

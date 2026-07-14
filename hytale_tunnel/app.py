@@ -160,9 +160,14 @@ def main() -> int:
     ap.add_argument("--font", help="chat font family (any installed font, e.g. 'Fira Code'); "
                     "default: your saved choice or monospace. Change it live with '/font <name>' "
                     "in the compose box; list installed fonts with '/font list'.")
+    # Server/console lines (voting, joins/leaves, deaths, broadcasts, …) are now shown BY
+    # DEFAULT -- the in-overlay noise filter (🧹) is the opt-out for hiding categories of them.
+    ap.add_argument("--hide-system", action="store_true",
+                    help="drop ALL server/console lines at the source (joins, deaths, "
+                         "broadcasts, …) instead of showing them and letting the 🧹 noise "
+                         "filter hide only the categories you pick")
     ap.add_argument("--show-system", action="store_true",
-                    help="also show server/console lines ([!], [Duel], joins, …); by "
-                         "default only messages sent by players are shown")
+                    help=argparse.SUPPRESS)      # back-compat no-op: system lines show by default
     ap.add_argument("--tunnel-only", action="store_true",
                     help="show ONLY encrypted tunnel messages (classic private-channel "
                          "mode) instead of mirroring all player chat")
@@ -296,7 +301,7 @@ def main() -> int:
                 on_message=lambda m: inbox.put((MSG, m)),
                 on_ready=lambda: inbox.put((SYS, "ready — mirroring chat (quiche)")),
                 stop=stop, proc_holder=proc_holder, my_name=my_name,
-                show_system=args.show_system, tunnel_only=args.tunnel_only,
+                show_system=not args.hide_system, tunnel_only=args.tunnel_only,
                 debug_log=os.environ.get("HYTALE_DEBUG")),
             daemon=True,
         )
@@ -320,7 +325,7 @@ def main() -> int:
     # a Hyprland keybind sends SIGUSR1 to this process. The flag is consumed by the
     # drain timer so the toggle happens on the Qt main thread.
     toggle = {"pending": False, "quit": False, "font": 0, "open": False,
-              "open_slash": False}
+              "open_slash": False, "ptoggle": False}
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, lambda *_: toggle.__setitem__("pending", True))
     # Global font resize (SUPER+SHIFT+± via Hyprland -> real-time signals). RT signals
@@ -333,6 +338,9 @@ def main() -> int:
         signal.signal(signal.SIGRTMIN + 3, lambda *_: toggle.__setitem__("open", True))
         # SIGRTMIN+4 = "open & focus the chat, pre-filled with '/'" (the slash quick-command key).
         signal.signal(signal.SIGRTMIN + 4, lambda *_: toggle.__setitem__("open_slash", True))
+        # SIGRTMIN+5 = SUPER+SHIFT+P focus toggle (routed through the app so it sets the focus
+        # intent -> the click-bounce can't eat a hotkey open).
+        signal.signal(signal.SIGRTMIN + 5, lambda *_: toggle.__setitem__("ptoggle", True))
     # Graceful shutdown so the `finally` block runs and removes the PID file
     # (SIGTERM/SIGINT would otherwise kill us without cleanup, leaving a stale pid).
     for _signame in ("SIGTERM", "SIGINT"):
@@ -435,7 +443,14 @@ def main() -> int:
         except Exception:                            # noqa: BLE001
             return False
 
+    # Whenever WE deliberately focus the overlay (Enter / SUPER+SHIFT+P / '\' / expand), we set
+    # this so the click-bounce in _on_activation is suppressed for a moment -- otherwise a
+    # hotkey-open with the cursor happening to sit over the overlay was misread as a click and
+    # bounced straight back to the game ("chat won't open, dragging fixes it").
+    focus_intent = {"until": 0.0}
+
     def _focus_overlay() -> None:
+        focus_intent["until"] = time.monotonic() + 2.0
         _focus_window("hytale-tunnel")
         ui.raise_()
         ui.activateWindow()
@@ -455,6 +470,7 @@ def main() -> int:
         # don't grow. (Only while the game is on this workspace, so a click elsewhere still
         # opens it normally.)
         if (active and not ui._opened and not ui._collapsed
+                and time.monotonic() >= focus_intent["until"]   # not a hotkey-initiated open
                 and _cursor_over_overlay() and _game_on_active_ws()):
             _glog("activation.bounce")
             QtCore.QTimer.singleShot(0, _focus_game)
@@ -554,6 +570,14 @@ def main() -> int:
             if not ui._collapsed:            # like Enter, only opens from the passive HUD
                 _focus_overlay()
                 QtCore.QTimer.singleShot(80, lambda: ui.prefill("/"))
+        if toggle["ptoggle"]:                # SUPER+SHIFT+P: toggle focus overlay <-> game
+            toggle["ptoggle"] = False
+            if ui.isActiveWindow():
+                _focus_game()
+            else:
+                if ui._collapsed:
+                    ui.set_collapsed(False)  # expand the pill first
+                _focus_overlay()
         if toggle["font"]:
             delta, toggle["font"] = toggle["font"], 0
             ui.bump_font(delta)
@@ -628,25 +652,18 @@ def main() -> int:
         if text.split(None, 1)[0].lower() == "/font":
             _do_font(text)                       # keep the chat focused so you can try more
             return
-        # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
-        # the recipient's overlay detects the sentinel, downloads the URL and animates it.
-        gif_url = ""
-        if text.split(None, 1)[0].lower() == "/gif":
-            gif_url = text[len("/gif"):].strip()
-            if not gif_util.valid_url(gif_url):
-                inbox.put((SYS, "usage: /gif <direct .gif URL> (http/https)"))
-                return
-            if ui.recipient not in crypto.list_psk_friends():
-                inbox.put((SYS, "select a friend you share a key with — GIFs go over the "
-                                "encrypted channel"))
-                return
-            gif_util.push_recent(gif_url)
-            mode, friend, body = "private", ui.recipient, chatframe.GIF_SENTINEL + gif_url
-        else:
-            mode, friend, body = _parse_command(text, last_contact)
-            if mode == "error":
-                inbox.put((SYS, body))
-                return
+        # A GIF is just an inline direct .gif/.webp URL in the message body (the overlay's
+        # compose box shows it as a compact "[GIF]" token that expands to the URL on send).
+        # It rides the NORMAL channels: /msg <friend> ... [GIF] -> encrypted private (URL
+        # inside the ciphertext); /p ... [GIF] -> encrypted party; a bare/plain line -> public
+        # chat. The receiver's overlay finds the .gif URL in the (decrypted) body and animates
+        # it inline. So there's no GIF-specific send path -- just parse + route as usual.
+        mode, friend, body = _parse_command(text, last_contact)
+        if mode == "error":
+            inbox.put((SYS, body))
+            return
+        for _u in chatframe.gif_urls_in(body):       # remember any sent GIFs for the picker
+            gif_util.push_recent(_u)
 
         # Windows/memscan dedups own sends by token hash so the scanner doesn't show
         # our own message back as if the friend sent it. On Linux the quiche frame
@@ -666,8 +683,7 @@ def main() -> int:
             # ordering. On Windows (no stream) we echo immediately.
             if not LINUX:
                 ui.add_message(Msg(sender="you", body=body, kind="whisper_out",
-                                   is_self=True, is_tunnel=True, target=friend,
-                                   is_gif=bool(gif_url), gif_url=gif_url))
+                                   is_self=True, is_tunnel=True, target=friend))
 
             def _do_send() -> None:
                 try:
@@ -726,8 +742,8 @@ def main() -> int:
             QtCore.QTimer.singleShot(60, _focus_game)
 
     ui.submitted.connect(on_submit)
-    # GIF picker: clicking a GIF sends it (reuse the /gif path); ✕/☆ save/unsave a favorite.
-    ui.gif_send.connect(lambda url: on_submit("/gif " + url))
+    # GIF picker: clicking a GIF drops a '[GIF]' token into the compose box (overlay.insert_gif,
+    # expands to the URL on send); the ✕/☆ buttons save/delete favorites via gif_action.
 
     def _do_gif_action(action: str, url: str) -> None:
         if action == "add":
