@@ -334,7 +334,7 @@ def send_party_message(message: str, open_key: str = "Return",
     for idx, tok in enumerate(tokens):
         if pre_send:
             pre_send(tok)
-        line = f"/party chat {tok}"
+        line = f"{crypto.PARTY_PREFIX}{tok}"
         _send_line(line, open_key, type_delay_ms, paste_method, use_paste)
         if idx < len(tokens) - 1:
             _sleep(T_CHUNK_GAP)

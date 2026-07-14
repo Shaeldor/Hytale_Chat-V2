@@ -12,7 +12,7 @@ def lines_for(mode: str, target: str | None, message: str) -> list[str]:
     if mode == "private":
         return [f"/msg {target} {t}" for t in crypto.encrypt_messages(target, message)]
     if mode in ("party", "party_private"):
-        return [f"/party chat {t}" for t in crypto.encrypt_group_messages(target, message)]
+        return [f"{crypto.PARTY_PREFIX}{t}" for t in crypto.encrypt_group_messages(target, message)]
     return crypto.split_public_lines(message)       # public: raw, but split to fit CHAT_LIMIT
 
 
