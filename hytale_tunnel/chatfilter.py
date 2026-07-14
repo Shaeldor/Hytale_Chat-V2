@@ -50,7 +50,11 @@ FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 #   (a 4th darker/richer red "!" for alerts wasn't captured yet -- grab its hex when you see one.)
 # e.g.  ("[!]", "startswith", "#ff5555")  hides only the light-red voting-style "[!]" lines.
 CATEGORIES = [
-    ("voting",    "Voting",        [("just voted and supported the server! vote now using /vote", "contains"), ("vote now using /vote", "contains"), ("vote party—", "startswith"), ("Vote Streak —", "startswith"), ("vote party!", "endswith"), ("vote! everyone online receives", "contains"), ("we reached 100 votes!", "endswith"), ("all online players receive", "startswith")]),
+    ("voting",    "Voting",        [("just voted and supported the server! vote now using /vote", "contains"), 
+                                    ("vote now using /vote", "contains"), ("vote party—", "startswith"), ("Vote Streak —", "startswith"), 
+                                    ("vote party!", "endswith"), ("vote! everyone online receives", "contains"), ("we reached 100 votes!", "endswith"), 
+                                    ("all online players receive", "startswith"), ("support the server by voting:/vote", "startswith"), 
+                                    ("you haven't voted yet!use /vote", "endswith"), ("you have free rewards yet to be claimed!", "contains")]),
     ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55")]),
     ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "endswith"), ("wandered off - nobody joined the raid.", "endswith")]),
     ("welcome",   "Welcome",       [("welcome", "endswith"), ("has joined histatu for the first time! welcome!", "endswith")]),
