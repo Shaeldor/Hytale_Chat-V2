@@ -343,6 +343,7 @@ class Overlay(QtWidgets.QWidget):
         hud_outer.setSpacing(0)
         hud_outer.addStretch(1)                  # pin the panel to the bottom
         self._hud_panel = QtWidgets.QWidget()
+        self._hud_panel.setObjectName("hx_hud_panel")   # so its border can't cascade to each line
         self._hud_panel.setStyleSheet(
             f"background: rgba(10,12,16,{BG_ALPHA}); border-radius:6px;")
         self._hud_layout = QtWidgets.QVBoxLayout(self._hud_panel)
@@ -402,9 +403,12 @@ class Overlay(QtWidgets.QWidget):
         self._font_family = _norm_family(th["font"])
         self._font_px = th["size"]
         self._apply_font()
-        edge = self._th_border if self._th_border != "none" else "1px solid rgba(120,130,150,60)"
+        # ID selector (#hx_hud_panel) so the panel's border stays on the panel and does NOT cascade
+        # to every fading line (a bare `border:` rule in Qt applies to all child widgets). Raw
+        # theme border -> "none" themes (standard) get no border at all.
         self._hud_panel.setStyleSheet(
-            f"background:{self._th_panel}; border:{edge}; border-radius:{self._th_radius}px;")
+            f"#hx_hud_panel{{background:{self._th_panel}; border:{self._th_border};"
+            f" border-radius:{self._th_radius}px;}}")
         self._TITLE_STYLE = f"color:{self._th_accent}; font-weight:bold;"
         self.title.setStyleSheet(self._TITLE_STYLE)
         if getattr(self, "_opened", None) is None:
