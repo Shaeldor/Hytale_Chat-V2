@@ -18,7 +18,7 @@ from PyQt6 import QtCore, QtWidgets
 
 from . import chatframe, crypto, gif_util, inject_client, memscan, playername, send
 from .chatframe import Msg
-from .overlay import Overlay
+from .overlay import Overlay, THEMES, THEME_ORDER
 
 LINUX = sys.platform.startswith("linux")
 
@@ -224,6 +224,7 @@ def main() -> int:
     # Font family: explicit --font > saved choice > default (monospace, handled by Overlay).
     saved_family = args.font or (state.get("font_family")
                                  if isinstance(state.get("font_family"), str) else None)
+    saved_theme = state.get("theme") if isinstance(state.get("theme"), str) else None
     saved_size = ((state["w"], state["h"]) if isinstance(state.get("w"), int)
                   and isinstance(state.get("h"), int) else None)
     # Defend against a corrupted (grown) passive height leaking in from an older build:
@@ -257,8 +258,9 @@ def main() -> int:
     QtWidgets.QApplication.setDesktopFileName("hytale-tunnel")
     app = QtWidgets.QApplication(sys.argv)
     ui = Overlay(recipient, friends, font_px=saved_font, size=saved_size,
-                 font_family=saved_family)
+                 font_family=saved_family, theme=saved_theme)
     ui.refresh_friends(friends, crypto.list_incoming_requests())   # surface leftover requests
+    ui.theme_changed.connect(lambda _=None: persist())             # save the picked theme
 
     my_name = playername.detect(args.me)
 
@@ -640,6 +642,19 @@ def main() -> int:
                    else f"'{arg}' not found — applied closest match. '/font list' to see options."))
         persist()
 
+    def _do_theme(text: str) -> None:
+        arg = text[len("/theme"):].strip().lower()
+        names = ", ".join(THEME_ORDER)
+        if not arg or arg == "list":
+            inbox.put((SYS, f"current theme: {ui._theme}.  Usage: /theme <name>  (or the 🎨 button). "
+                            f"Themes: {names}"))
+            return
+        if arg not in THEMES:
+            inbox.put((SYS, f"unknown theme '{arg}'. Themes: {names}"))
+            return
+        ui.set_theme(arg)                            # applies + persists (theme_changed -> persist)
+        inbox.put((SYS, f"theme set to {arg}"))
+
     def on_submit(text: str) -> None:
         text = text.strip()
         if not text:
@@ -651,6 +666,9 @@ def main() -> int:
             return
         if text.split(None, 1)[0].lower() == "/font":
             _do_font(text)                       # keep the chat focused so you can try more
+            return
+        if text.split(None, 1)[0].lower() == "/theme":
+            _do_theme(text)
             return
         # A GIF is just an inline direct .gif/.webp URL in the message body (the overlay's
         # compose box shows it as a compact "[GIF]" token that expands to the URL on send).
@@ -927,7 +945,7 @@ def main() -> int:
         if ui._collapsed:
             return
         st = {"font_px": ui._font_px, "recipient": ui.recipient,
-              "font_family": ui._font_family}
+              "font_family": ui._font_family, "theme": ui._theme}
         # Only the PASSIVE HUD size/pos is the persisted base. Capture geometry ONLY when
         # the window is stably at passive size: never while opened (grown ×_GROW), and never
         # during the post-transition settle window -- else the grown/mid-resize height leaks

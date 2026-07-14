@@ -95,6 +95,83 @@ def _brighten(hex_color: str) -> str:
     return "#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255))
 
 
+# ---- chat THEMES ---------------------------------------------------------------------------
+# Each theme restyles the whole overlay: the palette (author-class colours), the shared panel
+# background (a plain rgba OR a Qt qlineargradient), its border/corner-radius, the compose box,
+# the font family + size, a decorative wrap around player names (prefix, suffix), and the lock
+# glyph on encrypted lines. Real per-run in-game colours are still honoured; a theme recolours
+# everything we own (our messages, system/whisper/party, chrome, tags). Pick with /theme <name>
+# or the 🎨 button. Keys: font,size,panel,border,radius,input,text,you,other,tunnel,whisper,
+# party,emote,dim,sys,name(=(pre,suf)),lock,accent.
+_GRAD = "qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {0},stop:1 {1})"
+THEMES = {
+    "standard": dict(label="Standard", font="monospace", size=14,
+        panel="rgba(10,12,16,110)", border="none", radius=6, input="rgba(20,24,30,180)",
+        text="#e6e6e6", you="#9bf6a0", other="#c8d0dc", tunnel="#7ec8ff", whisper="#ff8fd0",
+        party="#ffd479", emote="#b9a9ff", dim="#7a828f", sys="#888888", name=("", ""),
+        lock="🔒 ", accent="#88ffdd"),
+    "modern": dict(label="Modern", font="sans-serif", size=14,
+        panel="rgba(22,26,33,150)", border="1px solid rgba(120,140,170,45)", radius=8,
+        input="rgba(30,35,44,200)", text="#dfe6ee", you="#7fd6a6", other="#b8c4d4",
+        tunnel="#6cb6ff", whisper="#e69ad0", party="#f2c66b", emote="#a9b6ff", dim="#8090a0",
+        sys="#778699", name=("", ""), lock="🔒 ", accent="#7fd6ff"),
+    "medieval": dict(label="Medieval", font="serif", size=15,
+        panel=_GRAD.format("rgba(40,29,16,185)", "rgba(24,17,9,195)"),
+        border="2px solid #8a6d3b", radius=4, input="rgba(40,30,18,210)", text="#ecd9b0",
+        you="#e8c46a", other="#d8c39a", tunnel="#b9d1a0", whisper="#c98fb0", party="#c05a4a",
+        emote="#c2a86a", dim="#9a855f", sys="#8a7a5a", name=("❧ ", ""), lock="⚜ ",
+        accent="#d4a94a"),
+    "futuristic": dict(label="Futuristic", font="monospace", size=14,
+        panel="rgba(6,10,18,175)", border="1px solid #2ff3ff", radius=3, input="rgba(10,16,26,215)",
+        text="#d6f4ff", you="#5cffb0", other="#9fd0e6", tunnel="#38f0ff", whisper="#ff5cf0",
+        party="#ffd23f", emote="#b98fff", dim="#5a8ba0", sys="#4a7a8a", name=("⟨", "⟩"),
+        lock="◈ ", accent="#2ff3ff"),
+    "lofi": dict(label="Lo-Fi / Comfy", font="sans-serif", size=14,
+        panel=_GRAD.format("rgba(44,32,46,155)", "rgba(30,24,34,165)"), border="none", radius=13,
+        input="rgba(48,38,50,205)", text="#ece0e6", you="#b8e0b0", other="#d8ccd6",
+        tunnel="#a8c8e0", whisper="#e6b0c8", party="#e8cfa0", emote="#c8b8e0", dim="#9a8ea0",
+        sys="#8a808c", name=("", ""), lock="☕ ", accent="#d8a8c0"),
+    "funny": dict(label="Funny", font="fantasy", size=15,
+        panel="rgba(32,20,42,155)", border="2px dashed #ff7fbf", radius=11, input="rgba(42,28,52,205)",
+        text="#fff0f8", you="#7fff7f", other="#ffe08a", tunnel="#7fdfff", whisper="#ff8fd0",
+        party="#ffb84f", emote="#d08fff", dim="#b0a0c0", sys="#a090b0", name=("🤪 ", ""),
+        lock="🎉 ", accent="#ff7fbf"),
+    "colorful": dict(label="Colorful", font="sans-serif", size=14,
+        panel=_GRAD.format("rgba(16,14,26,150)", "rgba(10,10,20,160)"), border="2px solid #ff5f8f",
+        radius=8, input="rgba(20,16,30,200)", text="#f2ecff", you="#4dff88", other="#ffd24d",
+        tunnel="#4dd2ff", whisper="#ff4dd2", party="#ff8f4d", emote="#b84dff", dim="#8f8f9f",
+        sys="#9a7fbf", name=("🌈 ", ""), lock="🔒 ", accent="#ff4d88"),
+    "bland": dict(label="Bland", font="sans-serif", size=14,
+        panel="rgba(20,20,22,120)", border="none", radius=4, input="rgba(30,30,32,185)",
+        text="#cccccc", you="#dddddd", other="#bbbbbb", tunnel="#cccccc", whisper="#c8c8c8",
+        party="#bcbcbc", emote="#c0c0c0", dim="#888888", sys="#777777", name=("", ""),
+        lock="· ", accent="#aaaaaa"),
+    "cyberpunk": dict(label="Cyberpunk", font="monospace", size=14,
+        panel="rgba(8,6,14,185)", border="1px solid #ff2fa0", radius=2, input="rgba(14,8,20,215)",
+        text="#e0d0ff", you="#39ff14", other="#b0a0d0", tunnel="#00e5ff", whisper="#ff2fa0",
+        party="#ffe14d", emote="#c04dff", dim="#7a5a8a", sys="#6a4a7a", name=("▐ ", ""),
+        lock="⚡ ", accent="#ff2fa0"),
+    "terminal": dict(label="Terminal", font="monospace", size=14,
+        panel="rgba(2,8,3,200)", border="1px solid #29a329", radius=2, input="rgba(4,14,5,220)",
+        text="#7dff7d", you="#b6ff9c", other="#7ee87e", tunnel="#59ffd0", whisper="#a0ff70",
+        party="#d6ff5a", emote="#8aff8a", dim="#3f8f3f", sys="#2f6f2f", name=("[", "]"),
+        lock="# ", accent="#29ff29"),
+    "vaporwave": dict(label="Vaporwave", font="sans-serif", size=14,
+        panel=_GRAD.format("rgba(40,20,50,155)", "rgba(20,30,55,165)"), border="1px solid #ff8fdf",
+        radius=8, input="rgba(40,26,54,205)", text="#f0e0ff", you="#7fffd4", other="#d8b8f0",
+        tunnel="#66e0ff", whisper="#ff9fdf", party="#ffd28f", emote="#c88fff", dim="#a088b8",
+        sys="#8878a0", name=("✧ ", ""), lock="🌴 ", accent="#ff8fdf"),
+    "forest": dict(label="Forest", font="serif", size=14,
+        panel=_GRAD.format("rgba(16,26,16,175)", "rgba(10,18,10,185)"), border="1px solid #5a7a3a",
+        radius=6, input="rgba(18,28,18,205)", text="#d6e6c0", you="#a8e06a", other="#c0d0a8",
+        tunnel="#8fd0b0", whisper="#d0a0b0", party="#d8c070", emote="#b0c88f", dim="#7a8a6a",
+        sys="#6a7a5a", name=("🌿 ", ""), lock="🍃 ", accent="#7aab4a"),
+}
+THEME_ORDER = ["standard", "modern", "medieval", "futuristic", "lofi", "funny",
+               "colorful", "bland", "cyberpunk", "terminal", "vaporwave", "forest"]
+DEFAULT_THEME = "standard"
+
+
 class Overlay(QtWidgets.QWidget):
     submitted = QtCore.pyqtSignal(str)          # emitted with composed plaintext
     collapsed_changed = QtCore.pyqtSignal()     # emitted after collapse/expand (resize)
@@ -102,6 +179,7 @@ class Overlay(QtWidgets.QWidget):
     dismissed = QtCore.pyqtSignal()             # Enter pressed with empty input -> unfocus
     friend_action = QtCore.pyqtSignal(str, str)  # (action, name): add / accept / remove
     gif_action = QtCore.pyqtSignal(str, str)    # (action, url): add / unfav / forget favorite
+    theme_changed = QtCore.pyqtSignal(str)      # (theme name) picked -> app persists it
     _gif_ready = QtCore.pyqtSignal(str)         # (url) a GIF finished downloading -> re-render
 
     def changeEvent(self, event) -> None:
@@ -110,13 +188,16 @@ class Overlay(QtWidgets.QWidget):
         super().changeEvent(event)
 
     def __init__(self, recipient: str, friends: list[str],
-                 font_px: int | None = None, size=None, font_family: str | None = None):
+                 font_px: int | None = None, size=None, font_family: str | None = None,
+                 theme: str | None = None):
         super().__init__()
         self.recipient = recipient
         self._collapsed = False
         self._unread = 0
         self._entries = []          # ordered [(kind, payload)] so filters can re-render
         self._filter_idx = 0
+        self._theme = theme if theme in THEMES else DEFAULT_THEME
+        self._theme_picker = None
         self._font_px = font_px or FONT_SIZE_PX
         self._font_family = _norm_family(font_family)
         self._gif_pending = set()    # GIF urls currently downloading
@@ -194,6 +275,16 @@ class Overlay(QtWidgets.QWidget):
         self._noise_panel = None
         self._update_noise_btn()
         header.addWidget(self.noise_btn)
+        # Theme picker: restyle the whole chat (modern, medieval, futuristic, lofi, …).
+        self.theme_btn = QtWidgets.QPushButton("🎨")
+        self.theme_btn.setToolTip("chat theme — restyle colours, fonts, background & tags")
+        self.theme_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.theme_btn.setStyleSheet(
+            "QPushButton{background:rgba(34,34,34,40);"
+            "border:1px solid rgba(58,65,80,70); border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
+        self.theme_btn.clicked.connect(self._open_theme_picker)
+        header.addWidget(self.theme_btn)
         header.addStretch(1)
         self.arrow = QtWidgets.QLabel("→")
         header.addWidget(self.arrow)
@@ -266,7 +357,13 @@ class Overlay(QtWidgets.QWidget):
         self.input.returnPressed.connect(self._on_submit)
         body.addWidget(self.input)
         root.addWidget(self.body, 1)
-        self._apply_font()                       # size the transcript + input box
+        self.apply_theme(self._theme)            # palette + font + panel/input styling
+        if font_family or font_px:               # an explicit/saved font overrides the theme's font
+            if font_family:
+                self._font_family = _norm_family(font_family)
+            if font_px:
+                self._font_px = font_px
+            self._apply_font()
 
         # --- dynamic display ---
         # Two modes while expanded: OPENED (focused via Enter / SUPER+SHIFT+P) shows the full
@@ -291,22 +388,53 @@ class Overlay(QtWidgets.QWidget):
     # ---- font sizing ----
     _FONT_MIN, _FONT_MAX = 8, 40
 
+    def apply_theme(self, name: str) -> None:
+        """Restyle the whole overlay to theme `name`: palette, panel background/border, compose box,
+        font family+size, name-tag decoration + lock glyph. Re-renders the current view."""
+        th = THEMES.get(name) or THEMES[DEFAULT_THEME]
+        self._theme = name if name in THEMES else DEFAULT_THEME
+        self._C_YOU, self._C_OTHER, self._C_TUNNEL = th["you"], th["other"], th["tunnel"]
+        self._C_WHISPER, self._C_PARTY, self._C_EMOTE = th["whisper"], th["party"], th["emote"]
+        self._C_DIM, self._C_SYS = th["dim"], th["sys"]
+        self._th_panel, self._th_border, self._th_radius = th["panel"], th["border"], th["radius"]
+        self._th_input, self._th_text = th["input"], th["text"]
+        self._th_name, self._th_lock, self._th_accent = th["name"], th["lock"], th["accent"]
+        self._font_family = _norm_family(th["font"])
+        self._font_px = th["size"]
+        self._apply_font()
+        edge = self._th_border if self._th_border != "none" else "1px solid rgba(120,130,150,60)"
+        self._hud_panel.setStyleSheet(
+            f"background:{self._th_panel}; border:{edge}; border-radius:{self._th_radius}px;")
+        self._TITLE_STYLE = f"color:{self._th_accent}; font-weight:bold;"
+        self.title.setStyleSheet(self._TITLE_STYLE)
+        if getattr(self, "_opened", None) is None:
+            return                               # during __init__: styled, nothing to re-render yet
+        if self._collapsed:
+            self.title.setStyleSheet(self._pill_style())
+        else:
+            self._rebuild() if self._opened else self._render_passive()
+
+    def _pill_style(self) -> str:
+        return (f"color:{self._th_accent}; font-weight:bold; background:rgba(20,24,30,235);"
+                f"border:1px solid {self._th_accent}; border-radius:6px; padding:4px 10px;")
+
     def _apply_font(self) -> None:
-        """(Re)apply the current font family + size + transparency to the transcript + input."""
-        in_alpha = min(235, BG_ALPHA + 70)      # compose box a touch more visible
+        """(Re)apply the current theme's font family + size + panel/input styling."""
         fam = _css_family(self._font_family)
         # ONE translucent rounded panel behind ALL messages (like the HUD's shared panel), not a
         # box per message. The bg MUST be set DIRECTLY on the transcript widget (that auto-enables
         # WA_StyledBackground so it actually paints -- a background in the QScrollArea's own
         # stylesheet targeting a child never paints). The transcript fills the viewport via
         # widgetResizable, the scroll area/viewport stay transparent, and message widgets paint none.
+        edge = self._th_border if self._th_border != "none" else "1px solid rgba(120,130,150,55)"
         self.view.setStyleSheet("QScrollArea{border:none; background:transparent;}")
         self.view.viewport().setStyleSheet("background:transparent;")
         self._transcript.setStyleSheet(
-            f"#hx_transcript{{background:rgba(10,12,16,{BG_ALPHA}); border-radius:6px;}}")
+            f"#hx_transcript{{background:{self._th_panel}; border:{self._th_border};"
+            f" border-radius:{self._th_radius}px;}}")
         self.input.setStyleSheet(
-            f"QLineEdit{{background:rgba(20,24,30,{in_alpha}); color:#fff;"
-            "border:1px solid rgba(90,100,120,110); border-radius:6px; padding:5px;"
+            f"QLineEdit{{background:{self._th_input}; color:{self._th_text};"
+            f"border:{edge}; border-radius:{self._th_radius}px; padding:5px;"
             f"font-family:{fam}; font-size:{self._font_px}px;}}")
 
     def set_font_family(self, name: str) -> bool:
@@ -410,7 +538,15 @@ class Overlay(QtWidgets.QWidget):
         """Build the HTML caption/text line for a chatframe.Msg (inline GIF URLs dropped -- they
         become animated widgets alongside). No side effects."""
         name = html.escape(msg.sender)
-        lock = "🔒 " if msg.is_tunnel else ""
+        lock = self._th_lock if msg.is_tunnel else ""
+
+        def deco(inner: str) -> str:                # wrap a player name in the theme's tag glyphs
+            pre, suf = self._th_name
+            if not pre and not suf:
+                return inner
+            a = self._th_accent
+            return (f'<span style="color:{a}">{html.escape(pre)}</span>{inner}'
+                    f'<span style="color:{a}">{html.escape(suf)}</span>')
         # BODY: reproduce the game's OWN per-run colours (multi-colour messages) when we have
         # them (non-tunnel); else emoji-expand our text and apply the single flat body colour.
         if not msg.is_tunnel and getattr(msg, "body_runs", None):
@@ -434,7 +570,7 @@ class Overlay(QtWidgets.QWidget):
 
         if msg.kind == "party":
             who = (f'<span style="color:{self._C_YOU}"><b>you</b></span>'
-                   if msg.is_self else colored_name())
+                   if msg.is_self else deco(colored_name()))
             line = (f'<span style="color:{self._C_PARTY}">{lock}[P] </span>'
                     f'{who}<span style="color:{self._C_DIM}">:</span> {body}')
         elif msg.kind == "emote":
@@ -442,7 +578,8 @@ class Overlay(QtWidgets.QWidget):
             line = (f'<span style="color:{self._C_EMOTE}"><i>{lock}* '
                     f'{html.escape(who)} {self._body_html(msg.body)}</i></span>')
         elif msg.kind == "whisper_in":
-            line = (f'<span style="color:{self._C_WHISPER}">{lock}<b>{name}</b></span>'
+            nm = deco(f'<span style="color:{self._C_WHISPER}"><b>{name}</b></span>')
+            line = (f'<span style="color:{self._C_WHISPER}">{lock}</span>{nm}'
                     f'<span style="color:{self._C_DIM}"> whispers:</span> {body}')
         elif msg.kind == "whisper_out":
             tgt = html.escape(msg.target or self.recipient)
@@ -455,7 +592,7 @@ class Overlay(QtWidgets.QWidget):
                     else "") or f'<span style="color:{self._C_SYS}">{self._body_html(msg.body)}</span>'
         else:  # public
             who = (f'<span style="color:{name_color}"><b>{name}</b></span>'
-                   if msg.is_self else colored_name())
+                   if msg.is_self else deco(colored_name()))
             line = f'{lock}{who}<span style="color:{self._C_DIM}">:</span> {body}'
         return line
 
@@ -514,7 +651,7 @@ class Overlay(QtWidgets.QWidget):
         sp.setHeightForWidth(True)               # get their full vertical space (no overlap)
         sp.setVerticalPolicy(QtWidgets.QSizePolicy.Policy.Minimum)
         lbl.setSizePolicy(sp)
-        lbl.setStyleSheet("background:transparent; color:#e6e6e6;"
+        lbl.setStyleSheet(f"background:transparent; color:{self._th_text};"
                           f"font-family:{_css_family(self._font_family)}; font-size:{self._font_px}px;")
         if selectable:
             lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -591,13 +728,13 @@ class Overlay(QtWidgets.QWidget):
             self.header.setVisible(True)         # the pill itself lives in the header
             self.body.setVisible(False)
             self.arrow.setVisible(False)
-            for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.noise_btn, self.friends_btn):
+            for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.noise_btn, self.theme_btn, self.friends_btn):
                 b.setVisible(False)
             return
         chrome = self._opened
         self.header.setVisible(chrome)           # passive -> no header/buttons
         self.arrow.setVisible(chrome)
-        for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.noise_btn, self.friends_btn):
+        for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.noise_btn, self.theme_btn, self.friends_btn):
             b.setVisible(chrome)
         self.body.setVisible(True)
         self.view.setVisible(self._opened)       # opened -> scrollable history
@@ -763,6 +900,21 @@ class Overlay(QtWidgets.QWidget):
         """Show a dot on the broom when at least one filter is actively hiding messages."""
         self.noise_btn.setText("🧹●" if chatfilter.any_active() else "🧹")
 
+    # ---- theme picker ----
+
+    def _open_theme_picker(self) -> None:
+        if self._theme_picker is None:
+            self._theme_picker = ThemePicker(self)
+        self._theme_picker.rebuild()
+        self._theme_picker.popup(self.theme_btn)
+
+    def set_theme(self, name: str) -> None:
+        """Apply a theme AND persist it (the app saves it via theme_changed)."""
+        if name not in THEMES:
+            return
+        self.apply_theme(name)
+        self.theme_changed.emit(name)
+
     # ---- collapse / expand ----
 
     _PILL_STYLE = ("color:#8fd; font-weight:bold; background:rgba(20,24,30,235);"
@@ -774,8 +926,8 @@ class Overlay(QtWidgets.QWidget):
             return
         self._collapsed = collapsed
         if collapsed:
-            self.title.setText("🔒 ▸")
-            self.title.setStyleSheet(self._PILL_STYLE)
+            self.title.setText(f"{self._th_lock}▸")
+            self.title.setStyleSheet(self._pill_style())
             self._hud_clear()                    # stop any in-flight HUD fades
             self._cancel_fill()                  # stop any in-flight incremental history fill
             self._stop_transcript_gifs()         # pause opened-view GIF animations too
@@ -815,7 +967,7 @@ class Overlay(QtWidgets.QWidget):
     def _note_activity(self) -> None:
         if self._collapsed:
             self._unread += 1
-            self.title.setText(f"🔒 ● {self._unread}")
+            self.title.setText(f"{self._th_lock}● {self._unread}")
 
     def _set_recipient(self, name: str) -> None:
         self.recipient = name
@@ -1556,6 +1708,73 @@ class NoiseFilterPanel(QtWidgets.QWidget):
             self.custom_in.clear()
             self.rebuild()
             self._on_changed()
+
+    def popup(self, anchor) -> None:
+        gp = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + 4))
+        self.move(gp)
+        self.show()
+        self.raise_()
+
+
+class ThemePicker(QtWidgets.QWidget):
+    """Popup list of chat themes. Each entry is a live preview: it is styled in that theme's own
+    panel background, accent colour, border, font, lock glyph and name-tag, so you see the look
+    before you pick it. Clicking applies + persists the theme."""
+
+    def __init__(self, overlay):
+        super().__init__(overlay, QtCore.Qt.WindowType.Popup)
+        self._ov = overlay
+        self.setStyleSheet("background:rgba(18,21,27,248);"
+                           "border:1px solid #3a4150; border-radius:8px;")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        head = QtWidgets.QLabel("Chat theme")
+        head.setStyleSheet("color:#8fd; font-weight:bold; font-size:12px;")
+        lay.addWidget(head)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self._host = QtWidgets.QWidget()
+        self.rows = QtWidgets.QVBoxLayout(self._host)
+        self.rows.setSpacing(5)
+        self.rows.setContentsMargins(0, 0, 0, 0)
+        self.rows.addStretch(1)
+        self.scroll.setWidget(self._host)
+        lay.addWidget(self.scroll, 1)
+        self.setFixedSize(300, 420)
+
+    def _clear(self) -> None:
+        while self.rows.count() > 1:                    # keep the trailing stretch
+            item = self.rows.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def rebuild(self) -> None:
+        self._clear()
+        cur = self._ov._theme
+        for i, name in enumerate(THEME_ORDER):
+            self.rows.insertWidget(i, self._card(name, THEMES[name], name == cur))
+
+    def _card(self, name: str, th: dict, current: bool) -> QtWidgets.QWidget:
+        pre, suf = th["name"]
+        tick = "✓ " if current else ""
+        btn = QtWidgets.QPushButton(f"  {tick}{th['lock']}{pre}{th['label']}{suf}")
+        btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        edge = th["border"] if th["border"] != "none" else "1px solid rgba(120,130,150,60)"
+        btn.setStyleSheet(
+            f"QPushButton{{text-align:left; background:{th['panel']}; color:{th['accent']};"
+            f"border:{edge}; border-radius:{th['radius']}px; padding:9px 11px; font-weight:bold;"
+            f"font-family:{_css_family(_norm_family(th['font']))}; font-size:14px;}}"
+            f"QPushButton:hover{{border:2px solid {th['accent']};}}")
+        btn.clicked.connect(lambda _=False, n=name: self._pick(n))
+        return btn
+
+    def _pick(self, name: str) -> None:
+        self._ov.set_theme(name)
+        self.rebuild()                                  # move the ✓ to the new selection
+        self.close()
 
     def popup(self, anchor) -> None:
         gp = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + 4))
