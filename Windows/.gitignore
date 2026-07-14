@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets & runtime state — NEVER commit (keys live in ~/.hytalecrypt/)
+.hytalecrypt/
+*.pem
+*.key
+seen.log
+tunnel.pid
+*.pid
