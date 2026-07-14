@@ -75,7 +75,7 @@ CATEGORIES = [
     ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
     ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
     ("dungeons",  "Dungeons",      [("reached Ascension", "contains"), ("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), ("entered the dungeon", "contains")]),
-    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("+", "number", "orange"), ("", "number", "blue")]),
+    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("+", "startswith", "orange"), ("", "number", "blue")]),
 ]
 
 _CAT_PATTERNS = {cid: pats for cid, _label, pats in CATEGORIES}
