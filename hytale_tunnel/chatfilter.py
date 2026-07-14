@@ -56,10 +56,12 @@ FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 # whose "!" is yellow vs orange vs red go into different categories. A category hides a line if
 # ANY of its patterns match; when a pattern has both text and colour, BOTH must hold. Patterns
 # are heuristics (server formats vary) -- tighten, recolour, disable, or use a 🧹 custom rule.
-#     {"keep": ("from", "contains")}    -> EXCEPTION: a line matching a "keep" pattern is NEVER
-#                                          hidden by that category, even if another pattern matched.
-#                                          Lets you say "hide green 'You received $...' EXCEPT the
-#                                          '...from <player>' ones" (which are also green).
+#     {"text":"you received $", "mode":"startswith", "color":"green", "except":("from","contains")}
+#                                       -> a dict pattern with an "except" sub-pattern: THIS pattern
+#                                          matches unless the line ALSO matches "except". Scoped to
+#                                          this one pattern only (unlike a category-wide rule), so it
+#                                          doesn't affect the category's other patterns. Lets you say
+#                                          "hide green 'You received $...' EXCEPT the '...from' ones".
 #
 # KNOWN "[!]" MARKER COLOURS on this server (from a debug capture) -- use these hex values to
 # split the "[!]" alert lines by the colour of the "!":
@@ -86,13 +88,13 @@ CATEGORIES = [
     ("keys",      "Key Drops",     [("[keys received]", "startswith"), ("community-wide key giveaway complete!", "startswith"), ("[key distribution]", "startswith")]),
     ("console",   "Console Cmds",  [("[!] console activated", "startswith"), ("[!] clearing up fog! enjoy the sun!", "endswith"), ("[timer]", "startswith"),
                                     ("saving chunks & data. expect a quick lag spike!", "contains"), ("chunk saving complete!", "contains"), ("hourly bonus:", "startswith"),
-                                    ("you received $", "startswith", "green"), {"keep": ("from", "contains")}]),
+                                    {"text": "you received $", "mode": "startswith", "color": "green", "except": ("from", "contains")}]),
     ("building",  "Building Event",[("histatu skyblock build event", "contains"), ("histatu build event", "startswith")]),
     ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
     ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
     ("dungeons",  "Dungeons",      [("reached Ascension", "contains"), ("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), 
                                     ("entered the dungeon", "contains"), ("collection rank earned:", "startswith"), ("[combo]", "startswith"), ("[$]", "startswith"),
-                                    ("you received $", "startswith"), {"keep": ("", "contains", "green")}]),
+                                    {"text": "you received $", "mode": "startswith", "except": ("", "contains", "green")}]),
     ("invisible", "Invisible Info",[("mmoskilltree", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan", "startswith"), ("", "number", "green", "startswith"),
                                     ("+", "number", "orange", "startswith"), ("", "number", "blue", "startswith"), ("+", "number", "yellow", "startswith"), ("level ", "number", "orange", "startswith")]),
 ]
@@ -328,7 +330,15 @@ def _match_region(text: str, mode: str, raw_lower: str):
 def _pattern_hit(pat, t: str, raw_lower: str, runs) -> bool:
     """A pattern matches if its TEXT condition (if any) holds AND its COLOUR condition (if any)
     holds -- the colour being checked in the region where the text matched (or anywhere, for a
-    colour-only pattern). An empty pattern never matches."""
+    colour-only pattern). An empty pattern never matches.
+
+    A dict pattern may carry an "except" sub-pattern: THIS pattern does not match a line that also
+    matches "except". Lets one pattern say "hide green 'You received $...' EXCEPT the '...from'
+    ones" without affecting the category's OTHER patterns."""
+    if isinstance(pat, dict):
+        exc = pat.get("except")
+        if exc is not None and _pattern_hit(exc, t, raw_lower, runs):
+            return False                               # the exception applies -> not a match
     text, mode, color, submode = _pattern_parts(pat)
     has_text_cond = bool(text) or mode == "number"     # "number" needs no text string
     if not has_text_cond and not color:
@@ -343,18 +353,6 @@ def _pattern_hit(pat, t: str, raw_lower: str, runs) -> bool:
         elif not _region_has_color(runs, region[0], region[1], color):
             return False
     return True
-
-
-def _category_hides(pats, t: str, raw_lower: str, runs) -> bool:
-    """Does a category hide this line? A normal pattern matching => hide, UNLESS an EXCEPTION
-    ('keep') pattern also matches -- a keep vetoes the hide. Keep pattern form:
-        {"keep": ("from", "contains")}   -> keep (never hide) any line containing "from"
-    so you can say e.g. "hide green 'You received $...' EXCEPT the '...from <player>' ones"."""
-    for p in pats:                                      # any exception match -> keep the line shown
-        if isinstance(p, dict) and "keep" in p and _pattern_hit(p["keep"], t, raw_lower, runs):
-            return False
-    return any(_pattern_hit(p, t, raw_lower, runs)
-               for p in pats if not (isinstance(p, dict) and "keep" in p))
 
 
 def should_hide(text: str, runs=None, is_player: bool = False) -> bool:
@@ -372,7 +370,7 @@ def should_hide(text: str, runs=None, is_player: bool = False) -> bool:
             continue
         if is_player and cid not in PLAYER_CATEGORIES:
             continue                                   # this category doesn't touch player chat
-        if _category_hides(_CAT_PATTERNS.get(cid, ()), t, raw_lower, runs):
+        if any(_pattern_hit(pat, t, raw_lower, runs) for pat in _CAT_PATTERNS.get(cid, ())):
             return True
     if not is_player:                                  # custom rules never touch player chat
         for r in d["custom"]:
