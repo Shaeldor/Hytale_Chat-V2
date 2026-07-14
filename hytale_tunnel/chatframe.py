@@ -214,6 +214,19 @@ def _printable_ratio(s: str) -> float:
     return sum(c.isprintable() or c in "\n\t " for c in s) / len(s) if s else 0.0
 
 
+def _looks_like_text(full: str) -> bool:
+    """Reject a reconstructed 'line' that is mostly binary garbage -- e.g. combat/entity data
+    (float positions, effect names like 'Impact_Poison') whose bytes happened to contain fake
+    colour-tag sequences, so parse_runs turned it into a spurious message full of undecodable
+    bytes. Real chat is almost entirely printable; the replacement char U+FFFD (which is itself
+    'printable', so it isn't caught by _printable_ratio) is the tell-tale of decoded binary."""
+    s = full.strip()
+    if not s:
+        return False
+    bad = sum(1 for c in s if c == "�" or (not c.isprintable() and c not in "\n\t "))
+    return bad / len(s) <= 0.15                     # >15% undecodable/control -> not a chat line
+
+
 @dataclass
 class ChatLine:
     kind: str           # 'public' | 'party' | 'whisper_in' | 'whisper_out' | 'emote' | 'system'
@@ -293,6 +306,8 @@ def parse(raw: bytes) -> ChatLine | None:
     if not runs:
         return None
     full = "".join(t for t, _ in runs)
+    if not _looks_like_text(full):                  # binary/garbage misparsed as a line -> drop it
+        return None
     return classify(full, runs)
 
 
@@ -314,7 +329,9 @@ def parse_all(raw: bytes) -> list[ChatLine]:
         # from its runs so every message is displayed.
         runs = parse_runs(raw)
         if runs:
-            lines.append(classify("".join(t for t, _ in runs), runs))
+            full = "".join(t for t, _ in runs)
+            if _looks_like_text(full):
+                lines.append(classify(full, runs))
         return lines
     for i, off in enumerate(offsets):
         end = offsets[i + 1] if i + 1 < len(offsets) else len(raw)
@@ -322,6 +339,8 @@ def parse_all(raw: bytes) -> list[ChatLine]:
         if not runs:
             continue
         full = "".join(t for t, _ in runs)
+        if not _looks_like_text(full):              # binary/garbage segment -> not a chat line
+            continue
         lines.append(classify(full, runs))
     return lines
 
