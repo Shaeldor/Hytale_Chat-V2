@@ -24,7 +24,7 @@ def _parse_command(text: str, last_contact: dict, channel: str):
     if channel == "Public":
         return "public", None, text
     elif channel.lower() == "party":
-        if crypto.load_group_key("party") is None:
+        if crypto.load_group_psk("party") is None:
             return "error", None, "no 'party' key set in groups. Run: hytalecrypt setkey party <key>"
         return "party_private", "party", text
     else:
@@ -247,14 +247,18 @@ def main() -> int:
         text = text.strip()
         if not text:
             return
-        
+        # Intercept friend commands typed in chat
+        if text.lower().startswith(r"\friend "):
+            _do_friend(text)
+            return
+
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
         # the receiver overlay sees the magic bytes and displays it as a GIF.
         gif_url = ""
-        if text.split(None, 1)[0].lower() == "/gif":
-            gif_url = text[len("/gif"):].strip()
+        if text.split(None, 1)[0].lower() == r"\gif":
+            gif_url = text[len(r"\gif"):].strip()
             if not gif_util.valid_url(gif_url):
-                inbox.put((SYS, "usage: /gif <direct .gif URL> (http/https)"))
+                inbox.put((SYS, r"usage: \gif <direct .gif URL> (http/https)"))
                 return
             if ui.recipient in ("Public", "Party"):
                 inbox.put((SYS, "select a friend you share a key with — GIFs go over the "
@@ -412,11 +416,11 @@ def main() -> int:
             inbox.put((SYS, f"Decrypted (Key: {key_name}) but payload too short."))
 
     def _do_friend(text: str) -> None:
-        parts = text.split(None, 2)                  # ['/friend', 'add', 'Bob']
+        parts = text.split(None, 2)                  # ['\friend', 'add', 'Bob']
         sub = parts[1].lower() if len(parts) > 1 else ""
         name = parts[2].strip() if len(parts) > 2 else ""
         if sub not in ("add", "accept", "remove") or not name:
-            inbox.put((SYS, "usage: /friend add|accept|remove <player>"))
+            inbox.put((SYS, r"usage: \friend add|accept|remove <player>"))
             return
             
         # Helper to inject public message without typing
@@ -430,7 +434,7 @@ def main() -> int:
             crypto.record_outgoing_request(name)
             _send_line(f"/msg {name} {crypto.hs_add_token()}")
             inbox.put((SYS, f"friend request sent to {name} — have them run: "
-                            f"/friend accept {my_name or 'you'}"))
+                            rf"\friend accept {my_name or 'you'}"))
         elif sub == "accept":
             pub = crypto.take_incoming_request(name)
             if pub is None:
@@ -458,9 +462,9 @@ def main() -> int:
     ui.custom_decrypt_requested.connect(on_custom_decrypt)
     ui.submitted.connect(on_submit)
     ui.dismissed.connect(send.focus_game)
-    ui.friend_action.connect(lambda action, nm: _do_friend(f"/friend {action} {nm}"))
+    ui.friend_action.connect(lambda action, nm: _do_friend(rf"\friend {action} {nm}"))
     ui.gif_action.connect(_do_gif_action)
-    ui.gif_send.connect(lambda url: on_submit("/gif " + url))
+    ui.gif_send.connect(lambda url: on_submit(r"\gif " + url))
 
     if memscan.find_client_pid() is None:
         ui.add_system("HytaleClient not running — waiting…")
