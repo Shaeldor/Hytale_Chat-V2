@@ -56,6 +56,10 @@ FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 # whose "!" is yellow vs orange vs red go into different categories. A category hides a line if
 # ANY of its patterns match; when a pattern has both text and colour, BOTH must hold. Patterns
 # are heuristics (server formats vary) -- tighten, recolour, disable, or use a 🧹 custom rule.
+#     {"keep": ("from", "contains")}    -> EXCEPTION: a line matching a "keep" pattern is NEVER
+#                                          hidden by that category, even if another pattern matched.
+#                                          Lets you say "hide green 'You received $...' EXCEPT the
+#                                          '...from <player>' ones" (which are also green).
 #
 # KNOWN "[!]" MARKER COLOURS on this server (from a debug capture) -- use these hex values to
 # split the "[!]" alert lines by the colour of the "!":
@@ -71,8 +75,9 @@ CATEGORIES = [
                                     ("all online players receive", "startswith"), ("support the server by voting:/vote", "startswith"), 
                                     ("you haven't voted yet!use /vote", "endswith"), ("you have free rewards yet to be claimed!", "contains")]),
     ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55"), ("[!] oil geyser detected on", "startswith")]),
-    ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "endswith"), 
-                                    ("wandered off - nobody joined the raid.", "endswith"), ("fled before it could be defeated...", "endswith"), ("fled...not enough damage dealt in time.", "endswith")]),
+    ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "contains"), 
+                                    ("wandered off - nobody joined the raid.", "endswith"), ("fled before it could be defeated...", "endswith"), ("fled...not enough damage dealt in time.", "endswith"),
+                                    ("rewards paid to everyone who struck it!", "endswith")]),
     ("welcome",   "Welcome",       [("welcome", "endswith"), ("has joined histatu for the first time! welcome!", "endswith")]),
     ("joinleave", "Join / Leave",  [("[+]", "startswith"), ("[-]", "endswith")]),
     ("discord",   "Discord",       [("[Discord]", "startswith")]),
@@ -80,16 +85,16 @@ CATEGORIES = [
     ("chatgames", "Chat Games",    [("[!]", "startswith", "#ffaa00"), ("[!] a new game has started!", "contains"), ("[!] no one answered correctly!", "endswith")]),
     ("keys",      "Key Drops",     [("[keys received]", "startswith"), ("community-wide key giveaway complete!", "startswith"), ("[key distribution]", "startswith")]),
     ("console",   "Console Cmds",  [("[!] console activated", "startswith"), ("[!] clearing up fog! enjoy the sun!", "endswith"), ("[timer]", "startswith"),
-                                    ("saving chunks & data. expect a quick lag spike!", "contains"), ("chunk saving complete!", "contains"), ("Hourly bonus:", "startswith"),
-                                    ("You received $5,000.", "startswith")]),
-    ("tractor",   "Tractor",       [("tractor", "contains"), ("/farm", "contains")]),
+                                    ("saving chunks & data. expect a quick lag spike!", "contains"), ("chunk saving complete!", "contains"), ("hourly bonus:", "startswith"),
+                                    ("you received $", "startswith", "green"), {"keep": ("from", "contains")}]),
     ("building",  "Building Event",[("histatu skyblock build event", "contains"), ("histatu build event", "startswith")]),
     ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
     ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
     ("dungeons",  "Dungeons",      [("reached Ascension", "contains"), ("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), 
-                                    ("entered the dungeon", "contains"), ("collection rank earned:", "startswith"), ("[combo]", "startswith")]),
+                                    ("entered the dungeon", "contains"), ("collection rank earned:", "startswith"), ("[combo]", "startswith"), ("[$]", "startswith"),
+                                    ("you received $", "startswith"), {"keep": ("", "contains", "green")}]),
     ("invisible", "Invisible Info",[("mmoskilltree", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan", "startswith"), ("", "number", "green", "startswith"),
-                                    ("+", "number", "orange", "startswith"), ("", "number", "blue", "startswith"), ("", "number", "yellow", "startswith"), ("", "contains"), ("����", "contains")]),
+                                    ("+", "number", "orange", "startswith"), ("", "number", "blue", "startswith"), ("+", "number", "yellow", "startswith"), ("level ", "number", "orange", "startswith")]),
 ]
 
 _CAT_PATTERNS = {cid: pats for cid, _label, pats in CATEGORIES}
@@ -340,6 +345,18 @@ def _pattern_hit(pat, t: str, raw_lower: str, runs) -> bool:
     return True
 
 
+def _category_hides(pats, t: str, raw_lower: str, runs) -> bool:
+    """Does a category hide this line? A normal pattern matching => hide, UNLESS an EXCEPTION
+    ('keep') pattern also matches -- a keep vetoes the hide. Keep pattern form:
+        {"keep": ("from", "contains")}   -> keep (never hide) any line containing "from"
+    so you can say e.g. "hide green 'You received $...' EXCEPT the '...from <player>' ones"."""
+    for p in pats:                                      # any exception match -> keep the line shown
+        if isinstance(p, dict) and "keep" in p and _pattern_hit(p["keep"], t, raw_lower, runs):
+            return False
+    return any(_pattern_hit(p, t, raw_lower, runs)
+               for p in pats if not (isinstance(p, dict) and "keep" in p))
+
+
 def should_hide(text: str, runs=None, is_player: bool = False) -> bool:
     """True if the message matches an ENABLED category or custom rule. `runs` is the message's
     [(text, '#rrggbb'), …] colour segments (needed only for colour rules). `is_player` is True
@@ -355,7 +372,7 @@ def should_hide(text: str, runs=None, is_player: bool = False) -> bool:
             continue
         if is_player and cid not in PLAYER_CATEGORIES:
             continue                                   # this category doesn't touch player chat
-        if any(_pattern_hit(pat, t, raw_lower, runs) for pat in _CAT_PATTERNS.get(cid, ())):
+        if _category_hides(_CAT_PATTERNS.get(cid, ()), t, raw_lower, runs):
             return True
     if not is_player:                                  # custom rules never touch player chat
         for r in d["custom"]:
