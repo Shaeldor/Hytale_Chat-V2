@@ -56,7 +56,8 @@ CATEGORIES = [
                                     ("all online players receive", "startswith"), ("support the server by voting:/vote", "startswith"), 
                                     ("you haven't voted yet!use /vote", "endswith"), ("you have free rewards yet to be claimed!", "contains")]),
     ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55"), ("reached Ascension", "contains")]),
-    ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "endswith"), ("wandered off - nobody joined the raid.", "endswith")]),
+    ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "endswith"), 
+                                    ("wandered off - nobody joined the raid.", "endswith"), ("fled before it could be defeated...", "endswith"), ("fled...not enough damage dealt in time.", "endswith")]),
     ("welcome",   "Welcome",       [("welcome", "endswith"), ("has joined histatu for the first time! welcome!", "endswith")]),
     ("joinleave", "Join / Leave",  [("[+]", "startswith"), ("[-]", "endswith")]),
     ("discord",   "Discord",       [("[Discord]", "startswith")]),
@@ -70,7 +71,8 @@ CATEGORIES = [
     ("building",  "Building Event",[("histatu skyblock build event", "contains"), ("histatu build event", "startswith")]),
     ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
     ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
-    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green")]),
+    ("dungeons",  "Dungeons",      [("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), ("entered the dungeon", "contains")]),
+    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("", "number", "orange"), ("", "number", "blue")]),
 ]
 
 _CAT_PATTERNS = {cid: pats for cid, _label, pats in CATEGORIES}
