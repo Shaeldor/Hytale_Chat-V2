@@ -26,6 +26,8 @@ CATEGORIES (from real traffic)
 import re
 from dataclasses import dataclass
 
+GIF_SENTINEL = "HXG1 "
+
 # Chat-log message type signature: header[4]==0xd2, header[8]==0x01, header[10]==0x40.
 TYPE_OFF, TYPE_B = 4, 0xD2
 SUB1_OFF, SUB1_B = 8, 0x01
@@ -220,6 +222,8 @@ class Msg:
     kind: str           # public | whisper_in | whisper_out | emote | system
     is_self: bool = False     # we sent it -> render as 'you'
     is_tunnel: bool = False   # was an encrypted tunnel token -> show the lock
+    is_gif: bool = False      # a GIF message -> render the animated GIF at gif_url
+    gif_url: str = ""         # the direct URL of the GIF
     target: str = ""          # whisper recipient (whisper_out)
     rank: str = ""            # rank tag, e.g. "Legend" ('' if none)
     rank_color: str = ""      # game's own colour for the rank tag ('' if unknown)

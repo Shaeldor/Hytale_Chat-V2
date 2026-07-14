@@ -190,7 +190,6 @@ class _Filter(QtCore.QAbstractNativeEventFilter):
         super().__init__()
         self._handlers = handlers          # {id: (callback, spec)}
         self._notify = notify
-        self._announced = set()
 
     def nativeEventFilter(self, eventType, message):
         try:
@@ -204,10 +203,7 @@ class _Filter(QtCore.QAbstractNativeEventFilter):
                           f"{'handled' if entry else 'no handler'}", flush=True)
                     if entry:
                         cb, spec = entry
-                        if self._notify and hid not in self._announced:
-                            self._announced.add(hid)
-                            self._notify(f"hotkey {spec} works ✓")
-                        cb()
+                        QtCore.QTimer.singleShot(0, cb)
         except Exception as e:             # never let the filter die silently
             print(f"[hotkey] filter error: {e!r}", flush=True)
         return False, 0
@@ -267,6 +263,9 @@ def _open_chat(ui) -> None:
     pill. Stays on-top; click it to type."""
     if getattr(ui, "_collapsed", False):
         ui.set_collapsed(False)
+        
+    if hasattr(ui, "set_opened"):
+        ui.set_opened(True)
     
     # We must explicitly force the OS to give us foreground, as Windows prevents
     # background windows from stealing focus from the active game.
@@ -278,9 +277,11 @@ def _open_chat(ui) -> None:
 
 def _close_chat(ui, find_pid) -> None:
     """Collapse to the pill and hand focus back to the game -- exactly what ESC does."""
+    _focus_game(find_pid)
+    if hasattr(ui, "set_opened"):
+        ui.set_opened(False)
     if not getattr(ui, "_collapsed", False):
         ui.set_collapsed(True)
-    _focus_game(find_pid)
 
 
 def _unfocus_chat(ui, find_pid) -> None:
@@ -303,8 +304,6 @@ def setup(app, ui, find_pid, open_spec="shift+up", close_spec="shift+down", unfo
     if notify:
         good = [s for s, ok in ((open_spec, ok_open), (close_spec, ok_close), (unfocus_spec, ok_unfocus)) if ok]
         bad = [s for s, ok in ((open_spec, ok_open), (close_spec, ok_close), (unfocus_spec, ok_unfocus)) if not ok]
-        if good:
-            notify("hotkeys ready: " + ", ".join(good))
         if bad:
             notify("hotkey(s) already in use: " + ", ".join(bad)
                    + " — set others with --hotkey-* args")

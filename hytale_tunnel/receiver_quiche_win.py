@@ -35,9 +35,34 @@ function resolve(name) {
 }
 const MAX = 1 << 16;               // max 64 KiB per stream read
 const r = resolve('quiche_conn_stream_recv');
+const r_send = resolve('quiche_conn_send');
+const r_stream_send = resolve('quiche_conn_stream_send');
+
+let active_conn = null;
+
 if (!r) { send({t: 'noexport'}); }
 else {
   send({t: 'ready', mod: r.mod, addr: r.addr.toString()});
+  
+  if (r_send) {
+    Interceptor.attach(r_send.addr, {
+      onEnter(a) { active_conn = a[0]; }
+    });
+  }
+  
+  if (r_stream_send) {
+    const stream_send_func = new NativeFunction(r_stream_send.addr, 'ssize_t', ['pointer', 'uint64', 'pointer', 'size_t', 'bool', 'pointer']);
+    rpc.exports = {
+      injectChatFrame: function(frameBytes) {
+        if (!active_conn || active_conn.isNull()) return -1;
+        const buf = Memory.alloc(frameBytes.length);
+        buf.writeByteArray(frameBytes);
+        const res = stream_send_func(active_conn, 0, buf, frameBytes.length, 0, NULL);
+        return parseInt(res.toString());
+      }
+    };
+  }
+
   Interceptor.attach(r.addr, {
     onEnter(a) { this.out = a[2]; },
     onLeave(rv) {
@@ -129,6 +154,18 @@ class _SessionHandle:
             except Exception:
                 pass
 
+_shared_handle = None
+
+def inject_frame(frame_bytes: bytes) -> bool:
+    """Inject a raw chat frame directly into the QUIC stream via the active Frida script."""
+    if not _shared_handle or not _shared_handle.script:
+        return False
+    try:
+        res = _shared_handle.script.exports_sync.inject_chat_frame(list(frame_bytes))
+        return int(res) >= 0
+    except Exception as e:
+        print(f"[quiche] inject_frame error: {e}")
+        return False
 
 _PLAYER_KINDS = {"public", "whisper_in", "whisper_out", "emote", "party"}
 
@@ -164,9 +201,24 @@ def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
         return None
     # The decrypted body is our own plaintext, not a game-rendered run -> no game
     # body colour for it (rank/name colour from the wire still applies).
-    return chatframe.Msg(sender=sender, body=out[1], kind=cl.kind,
+    plain = out[1]
+    is_gif = False
+    gif_url = ""
+    
+    if plain.startswith(chatframe.GIF_SENTINEL):
+        is_gif = True
+        gif_url = plain[len(chatframe.GIF_SENTINEL):].strip()
+    elif plain.startswith("HXG1"):
+        is_gif = True
+        gif_url = plain[len("HXG1"):].strip()
+    elif "http" in plain and (".gif" in plain.lower() or ".webp" in plain.lower()):
+        is_gif = True
+        gif_url = plain.strip()
+        
+    return chatframe.Msg(sender=sender, body=plain, kind=cl.kind,
                          is_self=is_self, is_tunnel=True, target=cl.target,
-                         rank=cl.rank, rank_color=cl.rank_color, name_color=cl.name_color)
+                         rank=cl.rank, rank_color=cl.rank_color, name_color=cl.name_color,
+                         is_gif=is_gif, gif_url=gif_url)
 
 
 def watch(on_message, stop=None, on_ready=None, proc_holder=None,
@@ -180,7 +232,11 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
     if pid_getter is None:
         pid_getter = memio.find_client_pid
     reasm = crypto.Reassembler()
+    
+    global _shared_handle
     handle = _SessionHandle()
+    _shared_handle = handle
+    
     if proc_holder is not None:
         proc_holder.append(handle)
     ready_sent = False

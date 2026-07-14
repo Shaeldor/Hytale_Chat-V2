@@ -29,9 +29,9 @@ if errorlevel 1 (
 )
 
 echo.
-echo Installing PyQt6 + cryptography + frida ...
+echo Installing PyQt6 + cryptography + frida + emoji ...
 "%PYEXE%" -m pip install --upgrade pip
-"%PYEXE%" -m pip install pyqt6 cryptography frida
+"%PYEXE%" -m pip install pyqt6 cryptography frida emoji
 if errorlevel 1 (
   echo.
   echo Install failed. Check your internet connection and try again.
