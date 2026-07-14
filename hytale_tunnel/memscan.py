@@ -173,7 +173,7 @@ def _scan_range(reader, start: int, end: int, ctx: dict, seen: set, emit) -> lis
 
 def _build_ctx() -> dict:
     """Load whatever keys we have, plus a reassembler for multi-part messages."""
-    ctx = {"keyed": crypto.loaded_psks(), "priv": None, "reasm": crypto.Reassembler()}
+    ctx = {"keyed": crypto.all_decrypt_keys(), "priv": None, "reasm": crypto.Reassembler()}
     try:
         ctx["priv"] = crypto.load_privkey()
     except Exception:

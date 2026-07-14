@@ -105,6 +105,48 @@ def _wl_copy(data):
         pass
 
 
+def _prep_paste(paste_method: str):
+    """Resolve whether clipboard paste is usable, and save the clipboard if so.
+
+    Paste is delivered via ydotool (kernel /dev/uinput = a REAL input device): apps
+    reject Ctrl+V from wtype's virtual keyboard, but accept ydotool's. Needs ydotoold.
+    Returns (yd_sock, use_paste, saved_clipboard).
+    """
+    yd_sock = _ydotool_socket()
+    use_paste = (paste_method in ("ctrl-v", "shift-insert")
+                 and bool(shutil.which("wl-copy")) and bool(shutil.which("ydotool"))
+                 and yd_sock is not None)
+    saved = None
+    if use_paste:
+        try:
+            saved = subprocess.run(["wl-paste", "-n"], capture_output=True,
+                                   timeout=2).stdout
+        except Exception:
+            saved = None
+    return yd_sock, use_paste, saved
+
+
+def _send_line(line: str, open_key: str, type_delay_ms: int, paste_method: str,
+               yd_sock: str | None, use_paste: bool) -> None:
+    yd_open = _YD_OPEN.get(open_key.lower(), _YD_ENTER)
+    if use_paste:
+        # The game's chat opens only from REAL keyboard input, so open + paste + send
+        # all via ydotool (uinput). wtype's virtual keyboard never opens the chat.
+        _wl_copy(line)                                # clipboard ready before paste
+        _yd(yd_sock, yd_open)                         # open chat (real Enter)
+        time.sleep(T_OPEN_WAIT)                       # let the chat finish opening
+        _yd(yd_sock, _YD_KEYS.get(paste_method, _YD_KEYS["ctrl-v"]),
+            delay=YD_COMBO_DELAY_MS)                  # paste
+        time.sleep(T_AFTER_INPUT)
+        _yd(yd_sock, _YD_ENTER)                       # send (real Enter)
+    else:
+        _wtype("-k", open_key)
+        time.sleep(T_OPEN_WAIT)
+        _type_line(line, type_delay_ms)
+        time.sleep(T_AFTER_INPUT)
+        _wtype("-k", "Return")
+
+
 def send_message(friend: str, message: str, open_key: str = "Return",
                  settle: float = 0.3, type_delay_ms: int = 12, pre_send=None,
                  paste_method: str = "type") -> list[str]:
@@ -117,46 +159,55 @@ def send_message(friend: str, message: str, open_key: str = "Return",
     ledger it (avoids the echo showing as a reply).
     """
     tokens = crypto.encrypt_messages(friend, message)
-    # Paste is delivered via ydotool (kernel /dev/uinput = a REAL input device): apps
-    # reject Ctrl+V from wtype's virtual keyboard, but accept ydotool's. Needs ydotoold.
-    yd_sock = _ydotool_socket()
-    use_paste = (paste_method in ("ctrl-v", "shift-insert")
-                 and bool(shutil.which("wl-copy")) and bool(shutil.which("ydotool"))
-                 and yd_sock is not None)
-    saved = None
-    if use_paste:
-        try:
-            saved = subprocess.run(["wl-paste", "-n"], capture_output=True,
-                                   timeout=2).stdout
-        except Exception:
-            saved = None
-
+    yd_sock, use_paste, saved = _prep_paste(paste_method)
     focus_game()
     time.sleep(T_SETTLE)
-    yd_open = _YD_OPEN.get(open_key.lower(), _YD_ENTER)
     for idx, tok in enumerate(tokens):
         if pre_send:
             pre_send(tok)
-        line = f"/msg {friend} {tok}"
-        if use_paste:
-            # The game's chat opens only from REAL keyboard input, so open + paste + send
-            # all via ydotool (uinput). wtype's virtual keyboard never opens the chat.
-            _wl_copy(line)                                # clipboard ready before paste
-            _yd(yd_sock, yd_open)                         # open chat (real Enter)
-            time.sleep(T_OPEN_WAIT)                       # let the chat finish opening
-            _yd(yd_sock, _YD_KEYS.get(paste_method, _YD_KEYS["ctrl-v"]),
-                delay=YD_COMBO_DELAY_MS)                  # paste
-            time.sleep(T_AFTER_INPUT)
-            _yd(yd_sock, _YD_ENTER)                       # send (real Enter)
-        else:
-            _wtype("-k", open_key)
-            time.sleep(T_OPEN_WAIT)
-            _type_line(line, type_delay_ms)
-            time.sleep(T_AFTER_INPUT)
-            _wtype("-k", "Return")
+        _send_line(f"/msg {friend} {tok}", open_key, type_delay_ms, paste_method,
+                  yd_sock, use_paste)
         if idx < len(tokens) - 1:
             time.sleep(T_CHUNK_GAP)
 
     if use_paste and saved:                       # restore the user's clipboard
         _wl_copy(saved)
     return tokens
+
+
+def send_party(group: str, message: str, open_key: str = "Return",
+               type_delay_ms: int = 12, pre_send=None,
+               paste_method: str = "type") -> list[str]:
+    """Encrypt `message` with the party group key, send as one or more '/p chat' lines.
+
+    Long messages are split into encrypted chunks (the receiver reassembles them).
+    `pre_send(token)` is called for each token before it is sent so the UI can ledger
+    it (Windows/memscan dedup; a no-op on the Linux quiche mirror)."""
+    tokens = crypto.encrypt_group_messages(group, message)
+    yd_sock, use_paste, saved = _prep_paste(paste_method)
+    focus_game()
+    time.sleep(T_SETTLE)
+    for idx, tok in enumerate(tokens):
+        if pre_send:
+            pre_send(tok)
+        _send_line(f"{crypto.PARTY_PREFIX}{tok}", open_key, type_delay_ms, paste_method,
+                   yd_sock, use_paste)
+        if idx < len(tokens) - 1:
+            time.sleep(T_CHUNK_GAP)
+    if use_paste and saved:                       # restore the user's clipboard
+        _wl_copy(saved)
+    return tokens
+
+
+def send_public(message: str, open_key: str = "Return", type_delay_ms: int = 12,
+                paste_method: str = "type") -> str:
+    """Type `message` into the in-game chat as a normal (unencrypted) public line --
+    no /msg prefix, no crypto. Used for plain compose-box input (anything that
+    isn't a /msg <name> or /r whisper)."""
+    yd_sock, use_paste, saved = _prep_paste(paste_method)
+    focus_game()
+    time.sleep(T_SETTLE)
+    _send_line(message, open_key, type_delay_ms, paste_method, yd_sock, use_paste)
+    if use_paste and saved:
+        _wl_copy(saved)
+    return message

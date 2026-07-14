@@ -2,15 +2,15 @@
 
 Hytale's own chat can't render emoji, but our Qt overlay can. We keep compact ASCII
 shortcodes on the encrypted wire and expand them to glyphs only when RENDERING (display
-side), so the payload stays small and shortcodes other players type render too.
+side), so the payload stays small and emoticons other players type render too.
 
-Only explicit ``:name:`` codes (e.g. ``:sob:``, ``:fire:``) are expanded — NOT smiley
-emoticons like ``:P``/``xD``/``<3``, which would fire on ordinary text. Uses the `emoji`
-package for the full ``:name:`` set. It degrades gracefully: if the package isn't
-installed, shortcodes are simply shown as-is and the picker inserts raw glyphs, so the
-overlay never breaks (handy before a friend has `pip install emoji`'d).
+Uses the `emoji` package for the full ``:name:`` set. It degrades gracefully: if the
+package isn't installed, shortcodes are simply shown as-is and the picker inserts raw
+glyphs, so the overlay never breaks (handy before a friend has `pip install emoji`'d).
     Install:  pacman -S python-emoji   (Arch/CachyOS)  |  pip install emoji  (Windows)
 """
+
+import re
 
 try:
     import emoji as _LIB
@@ -23,16 +23,37 @@ def available() -> bool:
     return _LIB is not None
 
 
+# Classic emoticons the :name: database doesn't cover. Matched only as WHITESPACE-BOUNDED
+# tokens (see _EMOTICON_RE) so they never fire inside a word, a time like "12:30", or a
+# ``:name:`` code like ":partying_face:". Expanded on RAW text (before HTML escaping) so
+# "<3" is matched before "<" would become "&lt;".
+_EMOTICONS = {
+    ":-)": "🙂", ":)": "🙂", ":-D": "😄", ":D": "😄", ";-)": "😉", ";)": "😉",
+    ":-(": "🙁", ":(": "🙁", ":-P": "😛", ":P": "😛", ":p": "😛",
+    "xD": "😆", "XD": "😆", "<3": "❤️", ":'(": "😢", ":o": "😮", ":O": "😮",
+    ":|": "😐", ":/": "😕", ":3": "😺",
+}
+# Longest keys first so ":-)" wins over ":)"; bounded by non-whitespace lookarounds so the
+# token must stand alone (preceded/followed by a space or the string edge).
+_EMOTICON_RE = re.compile(
+    r"(?<!\S)(" + "|".join(re.escape(k) for k in sorted(_EMOTICONS, key=len, reverse=True))
+    + r")(?!\S)")
+
+
 def emojize(text: str) -> str:
-    """Expand ``:name:`` shortcodes to emoji glyphs. Safe no-op for text with no codes,
-    or when the emoji lib is absent. Smiley emoticons (``:P``, ``xD``, ``<3`` …) are
-    deliberately NOT expanded — only explicit colon-delimited names like ``:sob:``."""
-    if not text or _LIB is None:
+    """Turn text shortcodes into emoji glyphs. Safe no-op for unmatched text / missing lib.
+
+    ``:name:`` codes are resolved first by the emoji lib (its own strict parser), then the
+    whitespace-bounded emoticons — so neither can corrupt the other.
+    """
+    if not text:
         return text
-    try:
-        return _LIB.emojize(text, language="alias")
-    except Exception:                             # noqa: BLE001 - never break rendering
-        return text
+    if _LIB is not None:
+        try:
+            text = _LIB.emojize(text, language="alias")
+        except Exception:                         # noqa: BLE001 - never break rendering
+            pass
+    return _EMOTICON_RE.sub(lambda m: _EMOTICONS[m.group(1)], text)
 
 
 def to_shortcode(ch: str) -> str:

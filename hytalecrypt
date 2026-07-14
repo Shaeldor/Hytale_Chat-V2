@@ -221,6 +221,16 @@ def cmd_list(args):
     else:
         print("   (none — create one with 'hytalecrypt genkey' + 'setkey <name> <key>')")
 
+    print()
+    print("=== PARTY GROUPS (/p) ===")
+    groups = _hc.list_groups()
+    if groups:
+        for name in groups:
+            print(f"   {name:20s}  AES {_hc.key_fingerprint(_hc.load_group_psk(name))}")
+    else:
+        print("   (none — create one with 'hytalecrypt gengroupkey' + "
+              "'setgroupkey <name> <key>')")
+
 
 def cmd_encrypt(args):
     """Encrypt a message for a friend."""
@@ -288,6 +298,34 @@ def cmd_setkey(args):
     print(f"   Saved to: {path}")
     print()
     print(f"Now: hytalecrypt senc {args.name} \"secret message\"")
+
+
+def cmd_gengroupkey(args):
+    """Generate a shared PARTY key: ONE key that every member of the party installs."""
+    key = _hc.gen_psk()
+    print("--- SHARED PARTY KEY (give this to EVERY member of the party, out of band) ---")
+    print(key)
+    print("--- END ---")
+    print()
+    print("Everyone in the party (including you) runs the SAME command with this key:")
+    print(f"   hytalecrypt setgroupkey party {key}")
+    print()
+    print("Then type '/p your message' in the overlay to send encrypted party chat.")
+
+
+def cmd_setgroupkey(args):
+    """Store a shared party group key (every party member uses the SAME key + name)."""
+    try:
+        path = _hc.set_group_psk(args.name, args.key)
+    except Exception as e:
+        print(f"❌ Invalid key: {e}", file=sys.stderr)
+        sys.exit(1)
+    raw = _hc.load_group_psk(args.name)
+    print(f"✅ Party key stored for group '{args.name}'")
+    print(f"   Key fingerprint: {_hc.key_fingerprint(raw)}  (must match every member!)")
+    print(f"   Saved to: {path}")
+    print()
+    print("Now type '/p your message' in the overlay to send encrypted party chat.")
 
 
 def cmd_senc(args):
@@ -379,6 +417,13 @@ p_setkey = sub.add_parser("setkey", help="Store a friend's shared tunnel key")
 p_setkey.add_argument("name", help="Friend's name/alias (must match their in-game name)")
 p_setkey.add_argument("key",  help="The shared key (base64, from genkey)")
 
+# Party groups (AES-256-GCM, ONE shared key for the whole party) — used by '/p'.
+p_ggk = sub.add_parser("gengroupkey", help="Generate a shared party key for the whole party")
+
+p_sgk = sub.add_parser("setgroupkey", help="Store a shared party group key")
+p_sgk.add_argument("name", help="Group name (e.g. 'party'); every member uses the same one")
+p_sgk.add_argument("key",  help="The shared party key (base64, from gengroupkey)")
+
 p_senc  = sub.add_parser("senc",    help="Symmetric-encrypt a message (fits chat limit)")
 p_senc.add_argument("recipient", help="Friend's name (must have a shared key)")
 p_senc.add_argument("message",   help="The message to encrypt")
@@ -401,6 +446,8 @@ if __name__ == "__main__":
         "decrypt":  cmd_decrypt,
         "genkey":  cmd_genkey,
         "setkey":  cmd_setkey,
+        "gengroupkey": cmd_gengroupkey,
+        "setgroupkey": cmd_setgroupkey,
         "senc":    cmd_senc,
         "sdec":    cmd_sdec,
         "help":    cmd_help,
