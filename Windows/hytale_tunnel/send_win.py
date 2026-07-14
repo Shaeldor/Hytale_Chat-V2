@@ -327,7 +327,7 @@ def send_public(message: str, open_key: str = "Return", type_delay_ms: int = 12,
 def send_party_message(message: str, open_key: str = "Return",
                        settle: float = 0.3, type_delay_ms: int = 12, pre_send=None,
                        paste_method: str = "ctrl-v") -> list[str]:
-    tokens = crypto.encrypt_messages("party", message)
+    tokens = crypto.encrypt_group_messages("party", message)
     use_paste = paste_method in ("ctrl-v", "shift-insert")
     focus_game()
     _sleep(T_SETTLE)
