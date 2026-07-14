@@ -4,110 +4,38 @@ Run via the `hytale-tunnel` launcher (which puts ~/.local/lib on PYTHONPATH).
 """
 
 import argparse
-import json
 import os
 import queue
 import signal
-import subprocess
 import sys
 import threading
 
 from PyQt6 import QtCore, QtWidgets
 
-from . import chatframe, crypto, memscan, playername, send
+from . import chatframe, crypto, memscan, playername, send, gif_util
 from .chatframe import Msg
 from .overlay import Overlay
 
-LINUX = sys.platform.startswith("linux")
 
-# Persisted overlay layout (position, size, font, recipient) so the overlay comes back
-# exactly where you left it. Written on change (polled) and on exit; loaded at startup.
-STATE_PATH = crypto.CONFIG_DIR / "overlay.json"
-
-
-def _load_state() -> dict:
-    try:
-        data = json.loads(STATE_PATH.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _query_geometry_linux():
-    """Our overlay's (x, y, w, h) relative to its monitor, via hyprctl, or None.
-    (Wayland doesn't tell Qt its own frame position, so we ask the compositor.)"""
-    try:
-        clients = json.loads(subprocess.run(["hyprctl", "-j", "clients"],
-                                            capture_output=True, text=True).stdout)
-        mons = json.loads(subprocess.run(["hyprctl", "-j", "monitors"],
-                                         capture_output=True, text=True).stdout)
-    except Exception:                             # noqa: BLE001
-        return None
-    w = next((c for c in clients if c.get("class") == "hytale-tunnel"
-              or c.get("initialClass") == "hytale-tunnel"), None)
-    if not w or not w.get("at") or not w.get("size"):
-        return None
-    ax, ay = w["at"]
-    ww, hh = w["size"]
-    mon = next((m for m in mons if m.get("id") == w.get("monitor")), None) \
-        or (mons[0] if mons else None)
-    ox, oy = (mon["x"], mon["y"]) if mon else (0, 0)
-    return (ax - ox, ay - oy, ww, hh)
+def _parse_command(text: str, last_contact: dict, channel: str):
+    """Classify compose-box input based strictly on the selected channel dropdown."""
+    
+    # Dropdown-driven routing
+    if channel == "Public":
+        return "public", None, text
+    elif channel.lower() == "party":
+        if crypto.load_group_key("party") is None:
+            return "error", None, "no 'party' key set in groups. Run: hytalecrypt setkey party <key>"
+        return "party_private", "party", text
+    else:
+        # A specific friend is selected
+        return "private", channel, text
 
 
-def _parse_command(text: str, last_contact: dict):
-    """Classify compose-box input.
-
-    '/msg <name> <message>' or '/r <message>' (reply to whoever we last privately
-    exchanged messages with) -> encrypted private send to a specific friend.
-    '/p <message>' -> encrypted party send (to the shared party group key).
-    Anything else -> plain public chat, typed in-game exactly as-is, unencrypted.
-    Returns (mode, target, body) with mode in {'private', 'party', 'public', 'error'}
-    (for 'party' target is None -> resolved by the caller; 'error': body is a
-    user-facing message, target is None).
-    """
-    if text.startswith("/msg "):
-        parts = text[len("/msg "):].split(None, 1)
-        if len(parts) < 2:
-            return "error", None, "usage: /msg <name> <message>"
-        name = parts[0]
-        if name not in crypto.list_psk_friends():
-            known = ", ".join(crypto.list_psk_friends()) or "(none)"
-            return "error", None, f"unknown friend '{name}'. Known: {known}"
-        return "private", name, parts[1]
-    if text == "/p" or text.startswith("/p "):
-        body = text[len("/p"):].strip()
-        if not body:
-            return "error", None, "usage: /p <message>"
-        if not crypto.list_groups():
-            return "error", None, ("no party key set up. Everyone in the party runs: "
-                                   "hytalecrypt gengroupkey  →  setgroupkey party <key>")
-        return "party", None, body
-    if text == "/r" or text.startswith("/r "):
-        body = text[len("/r"):].strip()
-        if not body:
-            return "error", None, "usage: /r <message>"
-        if not last_contact["name"]:
-            return "error", None, "no one to reply to yet"
-        return "private", last_contact["name"], body
-    return "public", None, text
-
-
-def _pick_party_group(groups: list, explicit: str | None) -> str | None:
-    """Which party group '/p' sends to: an explicit --party name, else the group named
-    'party' if present, else the sole/first group ('' -> None when none exist)."""
-    if explicit:
-        return explicit
-    if not groups:
-        return None
-    return "party" if "party" in groups else groups[0]
-
-
-def _position_top_right(ui, app, pos=None) -> None:
-    """Place the overlay at `pos` (x, y) relative to the focused monitor, or a default
-    spot. Wayland ignores client-set positions, so on Linux we ask Hyprland to move it;
-    on Windows Qt's move() works natively."""
-    pos_x, pos_y = pos if pos else (60, 700)
+def _position_top_left(ui, app) -> None:
+    """Place the overlay at the top-left. Wayland ignores client-set positions, so
+    on Linux we ask Hyprland to move it; on Windows Qt's move() works natively."""
+    margin_x, margin_y = 12, 50
     if sys.platform.startswith("linux"):
         import json
         import subprocess
@@ -115,24 +43,22 @@ def _position_top_right(ui, app, pos=None) -> None:
             mons = json.loads(subprocess.run(["hyprctl", "-j", "monitors"],
                                              capture_output=True, text=True).stdout)
             mon = next((m for m in mons if m.get("focused")), mons[0])
-            x = int(mon["x"]) + pos_x
-            y = int(mon["y"]) + pos_y
+            scale = mon.get("scale", 1) or 1
+            x = int(mon["x"]) + margin_x
+            y = int(mon["y"]) + margin_y
             subprocess.run(["hyprctl", "dispatch", "movewindowpixel",
                             f"exact {x} {y},class:^(hytale-tunnel)$"], capture_output=True)
         except Exception:
             pass
     else:
         scr = app.primaryScreen().availableGeometry()
-        ui.move(scr.left() + pos_x, scr.top() + pos_y)
+        ui.move(scr.left() + margin_x, scr.top() + margin_y)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="hytale-tunnel",
                                  description="Encrypted in-game chat tunnel overlay.")
     ap.add_argument("-r", "--recipient", help="default friend to send to")
-    ap.add_argument("--party", help="which party group key '/p' sends to (default: the "
-                    "group named 'party', or your only group). Set up with "
-                    "'hytalecrypt gengroupkey' + 'setgroupkey <name> <key>'")
     ap.add_argument("--me", help="your in-game name (auto-detected from the client "
                     "log if omitted); used to render your own messages as 'you'")
     ap.add_argument("--show-system", action="store_true",
@@ -161,6 +87,18 @@ def main() -> int:
                     help="skip memory regions larger than N bytes during sweeps "
                          "(default 128MB; chat lives in small regions, so this skips the "
                          "huge GPU/heap arenas and makes sweeps faster). 0 = no limit.")
+    ap.add_argument("--no-quiche", action="store_true",
+                    help="Windows: skip the quiche/Frida hook and use the memory "
+                         "scanner instead (fallback if the hook misbehaves)")
+    ap.add_argument("--font-size", type=int, default=14,
+                    help="overlay chat font size in px (default 14; adjust live in the "
+                         "overlay with Ctrl++ / Ctrl+- / Ctrl+0)")
+    ap.add_argument("--hotkey-open", default="shift+up",
+                    help="Windows global hotkey to open the chat (default: shift+up)")
+    ap.add_argument("--hotkey-close", default="shift+down",
+                    help="Windows global hotkey to close the chat (default: shift+down)")
+    ap.add_argument("--hotkey-unfocus", default="shift+left",
+                    help="Windows global hotkey to unfocus the chat but leave it expanded (default: shift+left)")
     ap.add_argument("--mark-seen", action="store_true",
                     help="record all messages currently in memory as seen, then exit "
                          "(open the in-game chat first to bake in the backlog)")
@@ -177,90 +115,106 @@ def main() -> int:
               "  hytalecrypt genkey           # generate, share with your friend\n"
               "  hytalecrypt setkey <name> <key>", file=sys.stderr)
         return 1
-    # Restore saved layout (position/size/font/recipient). Recipient precedence:
-    # explicit --recipient, else the saved one, else "Revenir" if we hold a key for it,
-    # else the first friend.
-    state = _load_state()
-    recipient = (args.recipient or state.get("recipient")
-                 or ("Revenir" if "Revenir" in friends else friends[0]))
-    if recipient not in friends:
-        recipient = friends[0]
-    saved_font = state.get("font_px") if isinstance(state.get("font_px"), int) else None
-    saved_size = ((state["w"], state["h"]) if isinstance(state.get("w"), int)
-                  and isinstance(state.get("h"), int) else None)
-    saved_pos = ((state["x"], state["y"]) if isinstance(state.get("x"), int)
-                 and isinstance(state.get("y"), int) else None)
-    party_group = _pick_party_group(crypto.list_groups(), args.party)
+    recipient = args.recipient or friends[0]
 
-    # Silence harmless Qt warnings: the host-portal registration (custom app-id with no
-    # installed .desktop) and the AT-SPI accessibility adaptor. We need neither.
     os.environ.setdefault("QT_ACCESSIBILITY", "0")
     _rules = os.environ.get("QT_LOGGING_RULES", "")
     os.environ["QT_LOGGING_RULES"] = ((_rules + ";" if _rules else "")
                                       + "qt.qpa.services=false;qt.accessibility.atspi=false")
-    # Set the Wayland app-id to "hytale-tunnel" so Hyprland window rules/binds can
-    # match by class. app-id is set at window creation (reliable), unlike the title
-    # which Qt sets slightly later -- the title race left rules unapplied at random.
     QtWidgets.QApplication.setDesktopFileName("hytale-tunnel")
     app = QtWidgets.QApplication(sys.argv)
-    ui = Overlay(recipient, friends, font_px=saved_font, size=saved_size)
+    app.setQuitOnLastWindowClosed(False)
+    
+    settings = QtCore.QSettings("HytaleTunnel", "Overlay")
+    font_size = args.font_size
+    if settings.contains("font_size"):
+        font_size = settings.value("font_size", type=int)
+
+    ui = Overlay(recipient, friends, font_px=font_size)
 
     my_name = playername.detect(args.me)
 
-    # Receive thread -> thread-safe queue -> drained on the Qt main thread.
-    # Each item is (SYS, str) for a status line or (MSG, chatframe.Msg) for chat.
     SYS, MSG = object(), object()
     inbox: queue.Queue = queue.Queue()
     stop = threading.Event()
     proc_holder: list = []               # holds the elevated capture process (Linux)
     seen = None
-    # Who /r replies to: last friend we privately messaged, or who last privately
-    # messaged us (whichever happened most recently).
+    sent_tokens: set = set()             # our own outgoing tokens, to skip server echo
     last_contact = {"name": None}
-    if LINUX:
-        # Full mirror: capture every chat-log line at quiche's decrypt boundary (eBPF),
-        # in the server's canonical order, with the real sender from the frame.
+
+    if sys.platform.startswith("linux"):
         from . import receiver_quiche
         scanner = threading.Thread(
             target=receiver_quiche.watch,
             kwargs=dict(
                 on_message=lambda m: inbox.put((MSG, m)),
-                on_ready=lambda: inbox.put((SYS, "ready — mirroring chat (quiche)")),
+                on_ready=lambda: inbox.put((SYS, "ready — capturing chat (quiche)")),
                 stop=stop, proc_holder=proc_holder, my_name=my_name,
                 show_system=args.show_system, tunnel_only=args.tunnel_only,
                 debug_log=os.environ.get("HYTALE_DEBUG")),
             daemon=True,
         )
     else:
-        # Windows fallback: memory scanning (best-effort, tunnel messages only). No
-        # frame context, so no full mirror and no frame-order guarantee.
-        seen = memscan.SeenStore()
-        scanner = threading.Thread(
-            target=memscan.watch,
-            kwargs=dict(
-                on_message=lambda sender, text: inbox.put(
-                    (MSG, Msg(sender=sender, body=text, kind="whisper_in",
-                              is_tunnel=True))),
-                on_ready=lambda: inbox.put((SYS, "ready — watching for messages")),
-                interval=args.interval, sweep_interval=args.sweep,
-                max_region=args.max_region, seen=seen, workers=args.workers, stop=stop),
+        use_quiche = False
+        if not args.no_quiche:
+            try:
+                from . import receiver_quiche_win
+                use_quiche = receiver_quiche_win.available()
+            except Exception:
+                use_quiche = False
+        if use_quiche:
+            scanner = threading.Thread(
+                target=receiver_quiche_win.watch,
+                kwargs=dict(
+                    on_message=lambda m: inbox.put((MSG, m)),
+                    on_ready=lambda: inbox.put((SYS, "ready — capturing chat (quiche)")),
+                    stop=stop, proc_holder=proc_holder, my_name=my_name,
+                    show_system=args.show_system, tunnel_only=args.tunnel_only,
+                    debug_log=os.environ.get("HYTALE_DEBUG")),
             daemon=True,
-        )
+            )
+        else:
+            if not args.no_quiche:
+                inbox.put((SYS, "frida/quiche unavailable — using memory scan "
+                                "(run setup-windows.bat to enable the quiche hook)"))
+            seen = memscan.SeenStore()
+            def _memscan_on_message(sender: str, text: str):
+                is_gif = False
+                gif_url = ""
+                if text.startswith(chatframe.GIF_SENTINEL):
+                    is_gif = True
+                    gif_url = text[len(chatframe.GIF_SENTINEL):].strip()
+                elif text.startswith("HXG1"):
+                    is_gif = True
+                    gif_url = text[len("HXG1"):].strip()
+                elif "http" in text and (".gif" in text.lower() or ".webp" in text.lower()):
+                    is_gif = True
+                    gif_url = text.strip()
+                inbox.put((MSG, Msg(sender=sender, body=text, kind="whisper_in",
+                                    is_tunnel=True, is_gif=is_gif, gif_url=gif_url)))
 
-    # Global collapse/expand toggle from anywhere (even when the game is focused):
-    # a Hyprland keybind sends SIGUSR1 to this process. The flag is consumed by the
-    # drain timer so the toggle happens on the Qt main thread.
-    toggle = {"pending": False, "quit": False, "font": 0}
+            scanner = threading.Thread(
+                target=memscan.watch,
+                kwargs=dict(
+                    on_message=_memscan_on_message,
+                    on_ready=lambda: inbox.put((SYS, "ready — watching for messages")),
+                    interval=args.interval, sweep_interval=args.sweep,
+                    max_region=args.max_region, seen=seen, workers=args.workers, stop=stop),
+                daemon=True,
+            )
+
+    injector = None
+    if not sys.platform.startswith("linux") and use_quiche:
+        try:
+            from . import inject_client
+            injector = inject_client.Injector(gap=args.type_delay / 1000.0)
+            proc_holder.append(injector.proc)
+        except Exception as e:
+            inbox.put((SYS, f"injector unavailable: {e}"))
+
+    toggle = {"pending": False, "quit": False}
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, lambda *_: toggle.__setitem__("pending", True))
-    # Global font resize (SUPER+SHIFT+± via Hyprland -> real-time signals). RT signals
-    # queue in the kernel, so rapid presses accumulate instead of being coalesced; the
-    # handler just tallies the net delta, applied on the Qt thread by the drain timer.
-    if hasattr(signal, "SIGRTMIN"):
-        signal.signal(signal.SIGRTMIN + 1, lambda *_: toggle.__setitem__("font", toggle["font"] + 1))
-        signal.signal(signal.SIGRTMIN + 2, lambda *_: toggle.__setitem__("font", toggle["font"] - 1))
-    # Graceful shutdown so the `finally` block runs and removes the PID file
-    # (SIGTERM/SIGINT would otherwise kill us without cleanup, leaving a stale pid).
     for _signame in ("SIGTERM", "SIGINT"):
         if hasattr(signal, _signame):
             signal.signal(getattr(signal, _signame),
@@ -268,15 +222,11 @@ def main() -> int:
 
     def drain() -> None:
         if toggle["quit"]:
-            persist()                        # save layout while the window is still mapped
             app.quit()
             return
         if toggle["pending"]:
             toggle["pending"] = False
             ui.toggle_collapsed()
-        if toggle["font"]:
-            delta, toggle["font"] = toggle["font"], 0
-            ui.bump_font(delta)
         try:
             while True:
                 tag, payload = inbox.get_nowait()
@@ -297,81 +247,238 @@ def main() -> int:
         text = text.strip()
         if not text:
             return
-        mode, friend, body = _parse_command(text, last_contact)
+        
+        # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
+        # the receiver overlay sees the magic bytes and displays it as a GIF.
+        gif_url = ""
+        if text.split(None, 1)[0].lower() == "/gif":
+            gif_url = text[len("/gif"):].strip()
+            if not gif_util.valid_url(gif_url):
+                inbox.put((SYS, "usage: /gif <direct .gif URL> (http/https)"))
+                return
+            if ui.recipient in ("Public", "Party"):
+                inbox.put((SYS, "select a friend you share a key with — GIFs go over the "
+                                "encrypted tunnel (so they shouldn't go in Public chat!)"))
+                return
+            gif_util.push_recent(gif_url)
+            text = gif_url
+
+        channel = ui.recipient
+        mode, friend, body = _parse_command(text, last_contact, channel)
+        
         if mode == "error":
             inbox.put((SYS, body))
             return
 
-        # Windows/memscan dedups own sends by token hash so the scanner doesn't show
-        # our own message back as if the friend sent it. On Linux the quiche frame
-        # carries the real sender, so no ledger is needed -- our own line comes back
-        # through the stream (in correct order) and renders as 'you'.
         def _ledger(blob: str) -> None:
+            sent_tokens.add(blob)
             if seen is not None:
-                b = blob[3:] if blob[:3] in (crypto.SYM_MARKER, crypto.CHUNK_MARKER) else blob
+                b = blob[len(crypto.SYM_MARKER):] if blob.startswith(crypto.SYM_MARKER) else blob
                 seen.add(memscan.token_hash(b))
 
-        # Sending sleeps + shells out (focus, paste, keystrokes); do it OFF the Qt
-        # main thread so the overlay can never freeze if a subprocess stalls.
+        # We echo immediately if use_quiche is false, otherwise we suppress it.
         if mode == "private":
             last_contact["name"] = friend
-            # On Linux we DON'T echo optimistically: the server echoes our /msg back
-            # through quiche, so showing it now would both duplicate it and risk wrong
-            # ordering. On Windows (no stream) we echo immediately.
-            if not LINUX:
+            if not sys.platform.startswith("linux") and not use_quiche:
+                _is_gif = False
+                _gif_url = ""
+                if body.startswith(chatframe.GIF_SENTINEL):
+                    _is_gif = True
+                    _gif_url = body[len(chatframe.GIF_SENTINEL):].strip()
+                elif body.startswith("HXG1"):
+                    _is_gif = True
+                    _gif_url = body[len("HXG1"):].strip()
+                elif "http" in body and ".gif" in body.lower():
+                    _is_gif = True
+                    _gif_url = body.strip()
                 ui.add_message(Msg(sender="you", body=body, kind="whisper_out",
-                                   is_self=True, is_tunnel=True, target=friend))
+                                   is_self=True, is_tunnel=True, target=friend,
+                                   is_gif=_is_gif, gif_url=_gif_url))
 
             def _do_send() -> None:
                 try:
-                    send.send_message(friend, body, open_key=args.open_key,
-                                      pre_send=_ledger, paste_method=args.paste_method,
-                                      type_delay_ms=args.type_delay)
-                except Exception as e:               # noqa: BLE001 - surface to overlay
+                    if injector:
+                        injector.send(mode, friend, body)
+                    else:
+                        send.send_message(friend, body, open_key=args.open_key,
+                                          pre_send=_ledger, paste_method=args.paste_method,
+                                          type_delay_ms=args.type_delay)
+                except Exception as e:
                     inbox.put((SYS, f"send failed: {e}"))
-        elif mode == "party":                        # encrypted party (shared group key)
-            group = party_group
-            if not group:
-                inbox.put((SYS, "no party key set up"))
-                return
-            # On Linux the quiche mirror echoes our own /p line back (my_name match ->
-            # 'you'); on Windows there's no mirror, so echo immediately.
-            if not LINUX:
+        elif mode == "party_private":
+            if not sys.platform.startswith("linux") and not use_quiche:
+                _is_gif = False
+                _gif_url = ""
+                if body.startswith(chatframe.GIF_SENTINEL):
+                    _is_gif = True
+                    _gif_url = body[len(chatframe.GIF_SENTINEL):].strip()
+                elif body.startswith("HXG1"):
+                    _is_gif = True
+                    _gif_url = body[len("HXG1"):].strip()
+                elif "http" in body and ".gif" in body.lower():
+                    _is_gif = True
+                    _gif_url = body.strip()
                 ui.add_message(Msg(sender="you", body=body, kind="party",
-                                   is_self=True, is_tunnel=True))
+                                   is_self=True, is_tunnel=True, target="party",
+                                   is_gif=_is_gif, gif_url=_gif_url))
 
             def _do_send() -> None:
                 try:
-                    send.send_party(group, body, open_key=args.open_key,
-                                    pre_send=_ledger, paste_method=args.paste_method,
-                                    type_delay_ms=args.type_delay)
-                except Exception as e:               # noqa: BLE001 - surface to overlay
+                    if injector:
+                        injector.send(mode, friend, body)
+                    else:
+                        send.send_party_message(body, open_key=args.open_key,
+                                                pre_send=_ledger, paste_method=args.paste_method,
+                                                type_delay_ms=args.type_delay)
+                except Exception as e:
                     inbox.put((SYS, f"send failed: {e}"))
-        else:  # public -- plain in-game chat, unencrypted
-            # On Linux the quiche mirror echoes our own public line back (my_name
-            # match -> is_self); no public mirror on Windows, so echo immediately.
-            if not LINUX:
-                ui.add_message(Msg(sender="you", body=body, kind="public", is_self=True))
+        else:  # public
+            if not sys.platform.startswith("linux") and not use_quiche:
+                _is_gif = False
+                _gif_url = ""
+                if body.startswith(chatframe.GIF_SENTINEL):
+                    _is_gif = True
+                    _gif_url = body[len(chatframe.GIF_SENTINEL):].strip()
+                elif body.startswith("HXG1"):
+                    _is_gif = True
+                    _gif_url = body[len("HXG1"):].strip()
+                elif "http" in body and ".gif" in body.lower():
+                    _is_gif = True
+                    _gif_url = body.strip()
+                ui.add_message(Msg(sender="you", body=body, kind="public", is_self=True,
+                                   is_gif=_is_gif, gif_url=_gif_url))
 
             def _do_send() -> None:
                 try:
-                    send.send_public(body, open_key=args.open_key,
-                                     paste_method=args.paste_method,
-                                     type_delay_ms=args.type_delay)
-                except Exception as e:               # noqa: BLE001 - surface to overlay
+                    if injector:
+                        injector.send(mode, friend, body)
+                    else:
+                        send.send_public(body, open_key=args.open_key,
+                                         paste_method=args.paste_method,
+                                         type_delay_ms=args.type_delay)
+                except Exception as e:
                     inbox.put((SYS, f"send failed: {e}"))
         threading.Thread(target=_do_send, daemon=True).start()
 
+    def on_custom_encrypt(channel: str, text: str) -> None:
+        if channel == "Public":
+            inbox.put((SYS, "Cannot encrypt for the Public channel."))
+            return
+            
+        friend = "party" if channel.lower() == "party" else channel
+        if friend not in crypto.list_psk_friends():
+            inbox.put((SYS, f"No key set for '{friend}'."))
+            return
+            
+        if text.split(None, 1)[0].lower() == "/gif":
+            gif_url = text[len("/gif"):].strip()
+            if not gif_util.valid_url(gif_url):
+                inbox.put((SYS, "usage: /gif <direct .gif URL> (http/https)"))
+                return
+            gif_util.push_recent(gif_url)
+            text = gif_url
+            
+        tokens = crypto.encrypt_messages(friend, text)
+        if not tokens:
+            return
+            
+        from PyQt6.QtGui import QGuiApplication
+        cb = QGuiApplication.clipboard()
+        # If it's a long message, they get multiple tokens. We space-separate them.
+        cb.setText(" ".join(tokens))
+        inbox.put((SYS, f"Encrypted message for {friend} copied to clipboard!"))
+        
+    def on_custom_decrypt(token: str) -> None:
+        m = chatframe.HX_TOKEN_RE.search(token)
+        if not m:
+            inbox.put((SYS, "No valid HX token found in input."))
+            return
+            
+        tok = m.group(0)
+        marker, body64 = tok[:3], tok[3:]
+        dec = crypto.try_decrypt_sym(body64, crypto.loaded_psks())
+        if dec is None:
+            inbox.put((SYS, "Failed to decrypt token (unknown key or invalid data)."))
+            return
+            
+        key_name, payload = dec
+        if len(payload) >= 2:
+            try:
+                text = payload[2:].decode("utf-8")
+                inbox.put((SYS, f"Decrypted (Key: {key_name}): {text}"))
+            except UnicodeDecodeError:
+                inbox.put((SYS, f"Decrypted (Key: {key_name}) but invalid UTF-8."))
+        else:
+            inbox.put((SYS, f"Decrypted (Key: {key_name}) but payload too short."))
+
+    def _do_friend(text: str) -> None:
+        parts = text.split(None, 2)                  # ['/friend', 'add', 'Bob']
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        name = parts[2].strip() if len(parts) > 2 else ""
+        if sub not in ("add", "accept", "remove") or not name:
+            inbox.put((SYS, "usage: /friend add|accept|remove <player>"))
+            return
+            
+        # Helper to inject public message without typing
+        def _send_line(msg):
+            if injector:
+                injector.send("public", None, msg)
+            else:
+                send.send_public(msg, open_key=args.open_key, paste_method=args.paste_method, type_delay_ms=args.type_delay)
+                
+        if sub == "add":
+            crypto.record_outgoing_request(name)
+            _send_line(f"/msg {name} {crypto.hs_add_token()}")
+            inbox.put((SYS, f"friend request sent to {name} — have them run: "
+                            f"/friend accept {my_name or 'you'}"))
+        elif sub == "accept":
+            pub = crypto.take_incoming_request(name)
+            if pub is None:
+                inbox.put((SYS, f"no pending friend request from {name}"))
+                return
+            key = crypto.save_derived_friend_key(name, pub)
+            _send_line(f"/msg {name} {crypto.hs_accept_token()}")
+            inbox.put((SYS, f"now friends with {name} · key {crypto.key_fingerprint(key)} "
+                            f"(verify it matches theirs)"))
+        else:                                        # remove
+            msg = (f"removed friend {name}" if crypto.remove_friend(name)
+                   else f"no such friend: {name}")
+            inbox.put((SYS, msg))
+        ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+
+    def _do_gif_action(action: str, url: str) -> None:
+        if action == "add":
+            gif_util.add_favorite(url)
+        elif action == "unfav":
+            gif_util.remove_favorite(url)
+        elif action == "forget":
+            gif_util.forget(url)
+
+    ui.custom_encrypt_requested.connect(on_custom_encrypt)
+    ui.custom_decrypt_requested.connect(on_custom_decrypt)
     ui.submitted.connect(on_submit)
+    ui.dismissed.connect(send.focus_game)
+    ui.friend_action.connect(lambda action, nm: _do_friend(f"/friend {action} {nm}"))
+    ui.gif_action.connect(_do_gif_action)
+    ui.gif_send.connect(lambda url: on_submit("/gif " + url))
 
     if memscan.find_client_pid() is None:
         ui.add_system("HytaleClient not running — waiting…")
-    party_note = f" · party: {party_group}" if party_group else ""
-    ui.add_system(f"tunnel up · recipient: {recipient} · friends: "
-                  f"{', '.join(friends)}{party_note}")
+    
+    def _fmt_hk(hk: str) -> str:
+        return hk.title().replace("Shift+", "Sh+")
 
-    # PID file so a Hyprland keybind can signal exactly this process (SIGUSR1
-    # toggles the overlay) without a broad pkill that could hit other processes.
+    instructions = (
+        '<span style="color:#00d8ff; font-weight:bold;">TUNNEL UP</span><br>'
+        f'<span style="color:#8fd;">Friends: {", ".join(friends) if friends else "None"}</span><br>'
+        '<span style="color:#7a8190; font-size:12px;">'
+        f'{_fmt_hk(args.hotkey_open)} - Open Chat<br>'
+        f'{_fmt_hk(args.hotkey_close)} - Minimize Tunnel<br>'
+        f'{_fmt_hk(args.hotkey_unfocus)} - Game Focus'
+        '</span>'
+    )
+    ui.add_system_html(instructions)
+
     pidfile = crypto.CONFIG_DIR / "tunnel.pid"
     try:
         crypto.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -379,53 +486,54 @@ def main() -> int:
     except OSError:
         pidfile = None
 
-    # Keep the overlay pinned top-right, including after a collapse/expand resize
-    # (Hyprland re-centers floating windows on resize, so re-apply each time).
-    # Fire a few times at increasing delays: Hyprland repositions the window itself
-    # during its resize animation, so the last (post-animation) placement must win.
     def reposition() -> None:
-        for delay in (120, 400, 750):
-            QtCore.QTimer.singleShot(delay, lambda: _position_top_right(ui, app, saved_pos))
-    ui.collapsed_changed.connect(reposition)
-
-    # Persist layout so the overlay reopens exactly where it was left. Geometry is read
-    # from Hyprland (Wayland hides the frame position from Qt); font/recipient come from
-    # the widget. Skip while collapsed (that would save the tiny pill size). Written only
-    # when something changed, and once more on exit.
-    saved_state = {"last": dict(state)}
-
-    def persist() -> None:
-        if ui._collapsed:
-            return
-        st = {"font_px": ui._font_px, "recipient": ui.recipient}
-        geo = _query_geometry_linux() if LINUX else (
-            lambda g: (g.x(), g.y(), g.width(), g.height()))(ui.frameGeometry())
-        if geo:
-            st["x"], st["y"], st["w"], st["h"] = geo
-        else:                                    # keep last-known geometry if unreadable
-            for k in ("x", "y", "w", "h"):
-                if k in saved_state["last"]:
-                    st[k] = saved_state["last"][k]
-        if st != saved_state["last"]:
-            saved_state["last"] = st
-            try:
-                STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                STATE_PATH.write_text(json.dumps(st))
-            except OSError:
-                pass
-
-    persist_timer = QtCore.QTimer()
-    persist_timer.timeout.connect(persist)
-    persist_timer.start(4000)
+        geom = settings.value("geometry")
+        if geom:
+            ui.restoreGeometry(geom)
+            if not getattr(ui, "_collapsed", False) and hasattr(ui, "_expanded_size"):
+                ui.resize(ui._expanded_size)
+        else:
+            if getattr(ui, "_user_moved", False):      # don't fight a manual drag
+                return
+            for delay in (120, 400, 750):
+                QtCore.QTimer.singleShot(delay, lambda: _position_top_left(ui, app))
+    
+    if sys.platform.startswith("linux"):
+        ui.collapsed_changed.connect(reposition)
 
     scanner.start()
     ui.show()
     reposition()
+
+    hotkeys = None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            console_hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if console_hwnd:
+                ctypes.windll.user32.ShowWindow(console_hwnd, 6)  # SW_MINIMIZE
+                
+            from . import hotkeys_win
+            hotkeys = hotkeys_win.setup(
+                app, ui, memscan.find_client_pid,
+                open_spec=args.hotkey_open, close_spec=args.hotkey_close,
+                unfocus_spec=args.hotkey_unfocus,
+                notify=lambda m: inbox.put((SYS, m)))
+        except Exception as e:
+            inbox.put((SYS, f"global hotkeys unavailable: {e}"))
     try:
         return app.exec()
     finally:
-        persist()                            # capture wherever it was left
+        if not getattr(ui, "_collapsed", False):
+            settings.setValue("geometry", ui.saveGeometry())
+        settings.setValue("font_size", ui._font_px)
+        
         stop.set()
+        if hotkeys is not None:
+            try:
+                hotkeys.unregister_all()
+            except Exception:
+                pass
         for p in proc_holder:                # stop the elevated capture process
             try:
                 p.terminate()

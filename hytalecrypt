@@ -33,6 +33,15 @@ def _add_pkg_path():
 _add_pkg_path()
 from hytale_tunnel import crypto as _hc
 
+# Windows consoles (and any redirected/piped output) often use a legacy code page
+# like cp1252 that can't encode the emoji/box-drawing characters below, which would
+# crash with UnicodeEncodeError. Force UTF-8 and never die on an unencodable char.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 CONFIG_DIR = _hc.CONFIG_DIR
 MY_KEY_DIR = CONFIG_DIR
 MY_PRIV_PATH = _hc.MY_PRIV_PATH

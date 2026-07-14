@@ -26,6 +26,8 @@ CATEGORIES (from real traffic)
 import re
 from dataclasses import dataclass
 
+GIF_SENTINEL = "HXG1 "
+
 # Chat-log message type signature: header[4]==0xd2, header[8]==0x01, header[10]==0x40.
 TYPE_OFF, TYPE_B = 4, 0xD2
 SUB1_OFF, SUB1_B = 8, 0x01
@@ -39,33 +41,11 @@ HX_TOKEN_RE = re.compile(r"HX[12][A-Za-z0-9+/=]{20,}")
 # Line classifiers (applied to the reconstructed text).
 _RE_WHISPER_OUT = re.compile(r"^\[To (\S+)\] (.*)$", re.DOTALL)
 _RE_WHISPER_IN = re.compile(r"^\[From (\S+)\] (.*)$", re.DOTALL)
+_RE_PARTY = re.compile(r"^\[!\]\s+\[Party\]\s+([A-Za-z0-9_]{2,20}):\s(.*)$", re.DOTALL)
 # Group 1 = rank tag if present (e.g. "Legend"), group 2 = name, group 3 = body.
 _RE_PUBLIC = re.compile(
     r"^\[\d+\]\s+(?:\[([^\]]+)\]\s+)?([A-Za-z0-9_]{2,20}):\s(.*)$", re.DOTALL)
-# Party chat, e.g. "[!] [Party] <name>: <msg>". The game prefixes party lines with the
-# same "[!]" marker it uses for console output, and may add other bracket tags (a
-# player id, etc.), so we allow ANY run of leading "[...]" tags before the "[Party]"
-# tag, then an optional [<rank>] tag. Group 1 = rank (if any), 2 = name, 3 = body.
-_RE_PARTY = re.compile(
-    r"^(?:\[[^\]]*\]\s+)*?\[Party\]\s+(?:\[([^\]]+)\]\s+)?([A-Za-z0-9_]{2,20}):\s(.*)$",
-    re.DOTALL)
 _RE_EMOTE = re.compile(r"^\* ([A-Za-z0-9_]{2,20}) (.*)$", re.DOTALL)
-
-# Best-effort "<Name>: " sender extraction, used to attribute a party/chat line whose
-# exact prefix format we don't classify but that carries a decryptable tunnel token.
-_RE_SENDER_BEFORE = re.compile(r"([A-Za-z0-9_]{2,20}):\s")
-
-
-def sender_before_token(full: str, before: int) -> str:
-    """The last '<Name>: ' that appears in `full` before offset `before` ('' if none).
-
-    Lets us name the author of an encrypted party message even when its surrounding
-    chat format isn't one we classify -- the token decrypting is what proves it's real,
-    this just recovers who said it."""
-    best = ""
-    for m in _RE_SENDER_BEFORE.finditer(full, 0, max(0, before)):
-        best = m.group(1)
-    return best
 
 
 def _color_at(runs: list[tuple[str, str]], pos: int) -> str:
@@ -151,7 +131,7 @@ def parse_runs(raw: bytes) -> list[tuple[str, str]]:
 
 @dataclass
 class ChatLine:
-    kind: str           # 'public' | 'party' | 'whisper_in' | 'whisper_out' | 'emote' | 'system'
+    kind: str           # 'public' | 'whisper_in' | 'whisper_out' | 'emote' | 'system'
     sender: str         # display name of who sent it ('' for system)
     body: str           # message text (no name/prefix); for system = whole line
     full: str           # the full reconstructed line
@@ -188,9 +168,8 @@ def classify(full: str, runs: list[tuple[str, str]] | None = None) -> ChatLine:
                          name_color=color_for(m, 1), body_color=color_for(m, 2))
     m = _RE_PARTY.match(full)
     if m:
-        return ChatLine("party", m.group(2), m.group(3), full,
-                         rank=m.group(1) or "", rank_color=color_for(m, 1),
-                         name_color=color_for(m, 2), body_color=color_for(m, 3))
+        return ChatLine("party", m.group(1), m.group(2), full,
+                         name_color=color_for(m, 1), body_color=color_for(m, 2))
     m = _RE_PUBLIC.match(full)
     if m:
         return ChatLine("public", m.group(2), m.group(3), full,
@@ -240,9 +219,11 @@ class Msg:
     """A message ready for display (after classification + any decryption)."""
     sender: str         # who to show as the author ('you' handled via is_self)
     body: str           # text to display (decrypted if is_tunnel)
-    kind: str           # public | party | whisper_in | whisper_out | emote | system
+    kind: str           # public | whisper_in | whisper_out | emote | system
     is_self: bool = False     # we sent it -> render as 'you'
     is_tunnel: bool = False   # was an encrypted tunnel token -> show the lock
+    is_gif: bool = False      # a GIF message -> render the animated GIF at gif_url
+    gif_url: str = ""         # the direct URL of the GIF
     target: str = ""          # whisper recipient (whisper_out)
     rank: str = ""            # rank tag, e.g. "Legend" ('' if none)
     rank_color: str = ""      # game's own colour for the rank tag ('' if unknown)
