@@ -16,10 +16,19 @@ import re
 
 from . import crypto
 
-# A message body that is JUST a number (optional sign / decimal / thousands / %), e.g. "-298.0",
-# "52.6", "1,024", "100%". Used by the "number" filter mode to hide stray HUD/combat numbers that
-# leak onto the chat stream but aren't shown in the real in-game chat.
-_NUM_RE = re.compile(r"^[+-]?\d[\d.,]*%?$")
+# A number token (optional sign / decimal / thousands / %), e.g. "-298.0", "52.6", "1,024", "+25.3".
+# The "number" filter mode hides stray HUD/combat numbers that leak onto the chat stream but aren't
+# in the real in-game chat. Its "submode" (the pattern's 4th element) says WHERE the number sits:
+#   whole (default) = the ENTIRE message is the number; startswith = the message BEGINS with a number
+#   then more text ("+25.3 Combat XP"); endswith = ends with one; contains = has one anywhere.
+_NUM_TOKEN = r"[+-]?\d[\d.,]*%?"
+_NUM_RE = re.compile(r"^" + _NUM_TOKEN + r"$")           # whole-message number (kept for reuse)
+_NUM_ANCHORS = {
+    "whole":      re.compile(r"^(" + _NUM_TOKEN + r")$"),
+    "startswith": re.compile(r"^(" + _NUM_TOKEN + r")"),
+    "endswith":   re.compile(r"(" + _NUM_TOKEN + r")$"),
+    "contains":   re.compile(r"(" + _NUM_TOKEN + r")"),
+}
 
 FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 
@@ -33,12 +42,12 @@ FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 #     ("", "contains", "red")           -> colour-ONLY: any line containing a red run
 #     ("", "number")                    -> the whole message is JUST a number (-298.0, 52.6, 100%)
 #     ("", "number", "cyan")            -> a number-only message coloured cyan (safe HUD-number filter)
-#     ("+", "number", "orange")         -> a number-only message that STARTS WITH "+" and is orange
-#     ("+", "number", "orange", "startswith") -> same, but the 4th "submode" (startswith/endswith/
-#                                          contains) says HOW `text` applies to the number; default
-#                                          is startswith. e.g. ("00","number","","endswith") = a
-#                                          number ending in "00"; ("-","number","red","startswith") =
-#                                          a red negative number.
+#     ("+", "number", "orange")         -> the WHOLE message is a number that starts with "+", orange
+#     ("+", "number", "orange", "startswith") -> the message BEGINS with a "+"-number then more text
+#                                          ("+25.3 Combat XP"), orange. The 4th "submode"
+#                                          (startswith/endswith/contains) says WHERE the number sits;
+#                                          default (3-tuple) = the whole message is the number. `text`
+#                                          stays a required prefix of that number (e.g. "+", "-").
 # The "number" mode hides stray HUD/combat numbers that leak onto the chat stream but aren't shown
 # in the real in-game chat. It's safe: like every category (except those in PLAYER_CATEGORIES) it
 # only touches SERVER/system lines, so a player who literally types "52.6" is never hidden.
@@ -211,30 +220,24 @@ def _pattern_parts(pat) -> tuple:
         text = str(pat.get("text", "")).lower()
         mode = pat.get("mode") if pat.get("mode") in MODES else "contains"
         color = str(pat.get("color", "")).strip().lower()
-        submode = pat.get("submode") if pat.get("submode") in _TEXT_MODES else "startswith"
+        submode = pat.get("submode") if pat.get("submode") in _TEXT_MODES else "whole"
         return text, mode, color, submode
     if isinstance(pat, (tuple, list)):
         text = str(pat[0]).lower() if len(pat) > 0 else ""
         mode = pat[1] if len(pat) > 1 and pat[1] in MODES else "contains"
         color = str(pat[2]).strip().lower() if len(pat) > 2 else ""
-        submode = pat[3] if len(pat) > 3 and pat[3] in _TEXT_MODES else "startswith"
+        submode = pat[3] if len(pat) > 3 and pat[3] in _TEXT_MODES else "whole"
         return text, mode, color, submode
-    return str(pat).lower(), "contains", "", "startswith"
+    return str(pat).lower(), "contains", "", "whole"
 
 
-def _matches(text: str, mode: str, t: str, submode: str = "startswith") -> bool:
+def _matches(text: str, mode: str, t: str, submode: str = "whole") -> bool:
     """Does the (already-lowercased) message `t` match `text` under `mode`?"""
-    if mode == "number":                               # body is JUST a number...
-        ts = t.strip()
-        if not _NUM_RE.match(ts):
+    if mode == "number":                               # a number, positioned per `submode`:
+        m = _NUM_ANCHORS.get(submode, _NUM_ANCHORS["whole"]).search(t.strip())
+        if not m:                                      #   whole msg / at start / at end / anywhere
             return False
-        if not text:                                   # ...optionally also matching `text` under
-            return True                                #    `submode` (e.g. starts with "+")
-        if submode == "endswith":
-            return ts.endswith(text)
-        if submode == "contains":
-            return text in ts
-        return ts.startswith(text)
+        return not text or m.group(1).startswith(text)  # `text` = required prefix of the number ("+")
     if not text:
         return False
     if mode == "startswith":
