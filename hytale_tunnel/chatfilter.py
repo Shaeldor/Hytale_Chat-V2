@@ -33,6 +33,9 @@ FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 #     ("", "contains", "red")           -> colour-ONLY: any line containing a red run
 #     ("", "number")                    -> the whole message is JUST a number (-298.0, 52.6, 100%)
 #     ("", "number", "cyan")            -> a number-only message coloured cyan (safe HUD-number filter)
+#     ("+", "number", "orange")         -> a number-only message that STARTS WITH "+" and is orange
+#                                          (for "number" the text is an optional required prefix, e.g.
+#                                           "+" for gains or "-" for losses)
 # The "number" mode hides stray HUD/combat numbers that leak onto the chat stream but aren't shown
 # in the real in-game chat. It's safe: like every category (except those in PLAYER_CATEGORIES) it
 # only touches SERVER/system lines, so a player who literally types "52.6" is never hidden.
@@ -55,7 +58,7 @@ CATEGORIES = [
                                     ("vote party!", "endswith"), ("vote! everyone online receives", "contains"), ("we reached 100 votes!", "endswith"), 
                                     ("all online players receive", "startswith"), ("support the server by voting:/vote", "startswith"), 
                                     ("you haven't voted yet!use /vote", "endswith"), ("you have free rewards yet to be claimed!", "contains")]),
-    ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55"), ("reached Ascension", "contains")]),
+    ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55")]),
     ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "endswith"), 
                                     ("wandered off - nobody joined the raid.", "endswith"), ("fled before it could be defeated...", "endswith"), ("fled...not enough damage dealt in time.", "endswith")]),
     ("welcome",   "Welcome",       [("welcome", "endswith"), ("has joined histatu for the first time! welcome!", "endswith")]),
@@ -71,8 +74,8 @@ CATEGORIES = [
     ("building",  "Building Event",[("histatu skyblock build event", "contains"), ("histatu build event", "startswith")]),
     ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
     ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
-    ("dungeons",  "Dungeons",      [("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), ("entered the dungeon", "contains")]),
-    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("", "number", "orange"), ("", "number", "blue")]),
+    ("dungeons",  "Dungeons",      [("reached Ascension", "contains"), ("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), ("entered the dungeon", "contains")]),
+    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("+", "number", "orange"), ("", "number", "blue")]),
 ]
 
 _CAT_PATTERNS = {cid: pats for cid, _label, pats in CATEGORIES}
@@ -209,8 +212,11 @@ def _pattern_parts(pat) -> tuple:
 
 def _matches(text: str, mode: str, t: str) -> bool:
     """Does the (already-lowercased) message `t` match `text` under `mode`?"""
-    if mode == "number":                               # body is JUST a number ("text" is ignored)
-        return bool(_NUM_RE.match(t.strip()))
+    if mode == "number":                               # body is JUST a number...
+        ts = t.strip()
+        if not _NUM_RE.match(ts):
+            return False
+        return ts.startswith(text) if text else True   # ...optionally starting with `text` (e.g. "+")
     if not text:
         return False
     if mode == "startswith":
@@ -279,8 +285,8 @@ def _region_has_color(runs, start: int, end: int, spec: str) -> bool:
 
 def _match_region(text: str, mode: str, raw_lower: str):
     """Where `text` matched in `raw_lower` (offsets aligned with the runs), or None for a
-    colour-only pattern (no text -> the colour may be anywhere)."""
-    if not text:
+    colour-only / number pattern (colour may be anywhere in the line)."""
+    if not text or mode == "number":                   # a number line is one colour -> anywhere
         return None
     if mode == "startswith":
         i = raw_lower.find(text)
