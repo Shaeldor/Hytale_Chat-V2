@@ -34,8 +34,11 @@ FILTER_JSON = crypto.CONFIG_DIR / "chatfilter.json"
 #     ("", "number")                    -> the whole message is JUST a number (-298.0, 52.6, 100%)
 #     ("", "number", "cyan")            -> a number-only message coloured cyan (safe HUD-number filter)
 #     ("+", "number", "orange")         -> a number-only message that STARTS WITH "+" and is orange
-#                                          (for "number" the text is an optional required prefix, e.g.
-#                                           "+" for gains or "-" for losses)
+#     ("+", "number", "orange", "startswith") -> same, but the 4th "submode" (startswith/endswith/
+#                                          contains) says HOW `text` applies to the number; default
+#                                          is startswith. e.g. ("00","number","","endswith") = a
+#                                          number ending in "00"; ("-","number","red","startswith") =
+#                                          a red negative number.
 # The "number" mode hides stray HUD/combat numbers that leak onto the chat stream but aren't shown
 # in the real in-game chat. It's safe: like every category (except those in PLAYER_CATEGORIES) it
 # only touches SERVER/system lines, so a player who literally types "52.6" is never hidden.
@@ -75,7 +78,7 @@ CATEGORIES = [
     ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
     ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
     ("dungeons",  "Dungeons",      [("reached Ascension", "contains"), ("histatu dungeon world", "contains"), ("the dungeon.", "endswith"), ("left the dungeon", "contains"), ("entered the dungeon", "contains")]),
-    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("+", "startswith", "orange"), ("", "number", "blue")]),
+    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green"), ("+", "number", "orange", "startswith"), ("", "number", "blue")]),
 ]
 
 _CAT_PATTERNS = {cid: pats for cid, _label, pats in CATEGORIES}
@@ -191,32 +194,47 @@ def any_active() -> bool:
     return any(d["categories"].values()) or any(r["on"] for r in d["custom"])
 
 
+_TEXT_MODES = ("startswith", "endswith", "contains")
+
+
 def _pattern_parts(pat) -> tuple:
-    """Normalize a pattern to (lowercased text, mode, colour). Forms:
-        "substring"                    -> (text, 'contains', '')
-        ("text", "startswith")         -> (text, mode, '')
-        ("text", "startswith", "red")  -> also require a run of that COLOUR
-        {"text":.., "mode":.., "color":..}  -> dict form (any field optional)
-    `colour` is a name (red/orange/yellow/green/cyan/blue/purple/pink) or a '#rrggbb' hex."""
+    """Normalize a pattern to (lowercased text, mode, colour, submode). Forms:
+        "substring"                          -> (text, 'contains', '', 'startswith')
+        ("text", "startswith")               -> (text, mode, '', ...)
+        ("text", "startswith", "red")        -> also require a run of that COLOUR
+        ("+", "number", "orange", "startswith") -> a NUMBER, orange, whose text also matches `text`
+                                                   under the 4th "submode" (startswith/endswith/contains)
+        {"text":.., "mode":.., "color":.., "submode":..}  -> dict form (any field optional)
+    `submode` only applies to "number" mode (how the `text` prefix/suffix is matched; default
+    startswith). `colour` is a name (red/orange/yellow/green/cyan/blue/purple/pink) or a '#rrggbb' hex."""
     if isinstance(pat, dict):
         text = str(pat.get("text", "")).lower()
         mode = pat.get("mode") if pat.get("mode") in MODES else "contains"
-        return text, mode, str(pat.get("color", "")).strip().lower()
+        color = str(pat.get("color", "")).strip().lower()
+        submode = pat.get("submode") if pat.get("submode") in _TEXT_MODES else "startswith"
+        return text, mode, color, submode
     if isinstance(pat, (tuple, list)):
         text = str(pat[0]).lower() if len(pat) > 0 else ""
         mode = pat[1] if len(pat) > 1 and pat[1] in MODES else "contains"
         color = str(pat[2]).strip().lower() if len(pat) > 2 else ""
-        return text, mode, color
-    return str(pat).lower(), "contains", ""
+        submode = pat[3] if len(pat) > 3 and pat[3] in _TEXT_MODES else "startswith"
+        return text, mode, color, submode
+    return str(pat).lower(), "contains", "", "startswith"
 
 
-def _matches(text: str, mode: str, t: str) -> bool:
+def _matches(text: str, mode: str, t: str, submode: str = "startswith") -> bool:
     """Does the (already-lowercased) message `t` match `text` under `mode`?"""
     if mode == "number":                               # body is JUST a number...
         ts = t.strip()
         if not _NUM_RE.match(ts):
             return False
-        return ts.startswith(text) if text else True   # ...optionally starting with `text` (e.g. "+")
+        if not text:                                   # ...optionally also matching `text` under
+            return True                                #    `submode` (e.g. starts with "+")
+        if submode == "endswith":
+            return ts.endswith(text)
+        if submode == "contains":
+            return text in ts
+        return ts.startswith(text)
     if not text:
         return False
     if mode == "startswith":
@@ -301,11 +319,11 @@ def _pattern_hit(pat, t: str, raw_lower: str, runs) -> bool:
     """A pattern matches if its TEXT condition (if any) holds AND its COLOUR condition (if any)
     holds -- the colour being checked in the region where the text matched (or anywhere, for a
     colour-only pattern). An empty pattern never matches."""
-    text, mode, color = _pattern_parts(pat)
+    text, mode, color, submode = _pattern_parts(pat)
     has_text_cond = bool(text) or mode == "number"     # "number" needs no text string
     if not has_text_cond and not color:
         return False
-    if has_text_cond and not _matches(text, mode, t):
+    if has_text_cond and not _matches(text, mode, t, submode):
         return False
     if color:
         region = _match_region(text, mode, raw_lower)  # None for number/no-text -> colour anywhere
