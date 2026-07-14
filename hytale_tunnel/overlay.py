@@ -9,12 +9,19 @@ This works identically on Linux/Hyprland and Windows.
 """
 
 import colorsys
+import hashlib
 import html
 import os
+import threading
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-from . import emoji_util
+from . import emoji_util, gif_util
+
+# GIF display sizing (px, longest side): larger in the opened transcript, smaller in the
+# floating HUD so it's unobtrusive over the game.
+GIF_MAX_OPENED = 260
+GIF_MAX_HUD = 150
 
 FONT_SIZE_PX = int(os.environ.get("HYTALE_TUNNEL_FONT_SIZE", "14"))
 
@@ -72,6 +79,9 @@ class Overlay(QtWidgets.QWidget):
     activation_changed = QtCore.pyqtSignal(bool)  # window gained (True) / lost (False) focus
     dismissed = QtCore.pyqtSignal()             # Enter pressed with empty input -> unfocus
     friend_action = QtCore.pyqtSignal(str, str)  # (action, name): add / accept / remove
+    gif_send = QtCore.pyqtSignal(str)           # a GIF url picked in the picker -> send it
+    gif_action = QtCore.pyqtSignal(str, str)    # (action, url): add / remove favorite
+    _gif_ready = QtCore.pyqtSignal(str)         # (url) a GIF finished downloading -> re-render
 
     def changeEvent(self, event) -> None:
         if event.type() == QtCore.QEvent.Type.ActivationChange:
@@ -88,6 +98,12 @@ class Overlay(QtWidgets.QWidget):
         self._filter_idx = 0
         self._font_px = font_px or FONT_SIZE_PX
         self._font_family = _norm_family(font_family)
+        self._gif_pumps = {}         # gif_id -> QMovie animating an <img> in the opened view
+        self._gif_placed = set()     # gif_ids whose <img> is currently in the opened view
+        self._gif_pending = set()    # GIF urls currently downloading
+        self._hud_gif_by_url = {}    # url -> _FadingGif HUD line awaiting its download
+        self._gif_picker = None
+        self._gif_ready.connect(self._on_gif_ready)
         self._expanded_size = QtCore.QSize(*size) if size else QtCore.QSize(440, 320)
         self.setWindowTitle("hytale-tunnel")    # Hyprland matches this for window rules
         self.setWindowFlags(
@@ -136,6 +152,16 @@ class Overlay(QtWidgets.QWidget):
         self.emoji_btn.clicked.connect(self._open_emoji_picker)
         self._picker = None
         header.addWidget(self.emoji_btn)
+        # GIF picker button: browse/send saved GIF favorites, add a GIF by URL.
+        self.gif_btn = QtWidgets.QPushButton("🎬")
+        self.gif_btn.setToolTip("GIFs — send a saved favorite, or add one by URL")
+        self.gif_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.gif_btn.setStyleSheet(
+            "QPushButton{background:rgba(34,34,34,40);"
+            "border:1px solid rgba(58,65,80,70); border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
+        self.gif_btn.clicked.connect(self._open_gif_picker)
+        header.addWidget(self.gif_btn)
         header.addStretch(1)
         self.arrow = QtWidgets.QLabel("→")
         header.addWidget(self.arrow)
@@ -279,9 +305,15 @@ class Overlay(QtWidgets.QWidget):
             pass                                 # pill: nothing to draw (unread badge below)
         elif self._opened:
             if self._passes(msg):
-                self._append_html(self._format_message(msg))
+                if getattr(msg, "is_gif", False):
+                    self._append_gif_opened(msg)
+                else:
+                    self._append_html(self._format_message(msg))
         elif self._passes(msg):
-            self._hud_add(self._format_message(msg))   # own-timer fading HUD line
+            if getattr(msg, "is_gif", False):
+                self._hud_add_gif(msg)           # animated GIF as a fading HUD line
+            else:
+                self._hud_add(self._format_message(msg))   # own-timer fading HUD line
         if not msg.is_self:
             self._note_activity()
 
@@ -339,6 +371,138 @@ class Overlay(QtWidgets.QWidget):
     def _format_system(self, text: str) -> str:
         return f'<span style="color:{self._C_SYS}">· {html.escape(text)}</span>'
 
+    # ---- GIF rendering ----
+    # A GIF message carries a URL (msg.gif_url). We download+cache it (gif_util, off-thread)
+    # and animate it: in the opened QTextEdit via an <img> whose pixmap a QMovie swaps each
+    # frame (text rendering untouched); in the passive HUD via a QLabel.setMovie (native).
+
+    @staticmethod
+    def _gif_id(url: str) -> str:
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+    def _ensure_gif(self, url: str) -> bool:
+        """Return True if the GIF is already cached; else kick off a background download and
+        return False (self._gif_ready fires when it lands, triggering a re-render)."""
+        if not url or gif_util.is_cached(url):
+            return bool(url) and gif_util.is_cached(url)
+        if url not in self._gif_pending:
+            self._gif_pending.add(url)
+
+            def _work() -> None:
+                gif_util.fetch(url)
+                self._gif_ready.emit(url)        # queued back to the Qt thread
+            threading.Thread(target=_work, daemon=True).start()
+        return False
+
+    def _on_gif_ready(self, url: str) -> None:
+        # A GIF finished downloading. Update it IN PLACE (don't re-render the whole transcript
+        # -- that would reorder messages that arrived while it loaded, and reset every HUD
+        # fade). Opened: start the pump for its already-placed <img>. Passive: swap the movie
+        # into the loading HUD line that's already sitting in the right spot.
+        self._gif_pending.discard(url)
+        if self._collapsed:
+            return
+        if self._opened:
+            gid = self._gif_id(url)
+            if gid in self._gif_placed:
+                self._start_pump(gid, url)
+        else:
+            self._hud_gif_loaded(url)
+
+    def _make_movie(self, url: str, max_px: int):
+        """A started, aspect-scaled QMovie for a cached GIF, or None."""
+        mv = QtGui.QMovie(str(gif_util.cache_path(url)))
+        if not mv.isValid():
+            return None
+        mv.jumpToFrame(0)
+        sz = mv.currentImage().size()
+        if sz.width() > 0 and sz.height() > 0:
+            mv.setScaledSize(sz.scaled(max_px, max_px,
+                                       QtCore.Qt.AspectRatioMode.KeepAspectRatio))
+        return mv
+
+    def _clear_pumps(self) -> None:
+        for mv in self._gif_pumps.values():
+            mv.stop()
+        self._gif_pumps = {}
+        self._gif_placed = set()
+
+    def _gif_placeholder(self):
+        """A small 'loading' box used as the <img> resource until the GIF downloads, so the
+        image sits in the transcript in order and just gets its frames swapped in when ready."""
+        pm = QtGui.QPixmap(160, 90)
+        pm.fill(QtGui.QColor(20, 24, 30, 140))
+        p = QtGui.QPainter(pm)
+        p.setPen(QtGui.QColor("#9aa4b2"))
+        p.drawText(pm.rect(), int(QtCore.Qt.AlignmentFlag.AlignCenter), "🎞️ loading GIF…")
+        p.end()
+        return pm
+
+    def _start_pump(self, gid: str, url: str) -> None:
+        """Animate an <img src="gif://gid"> already in the opened QTextEdit by swapping its
+        image resource each QMovie frame. One relayout to size it to the gif, then per-frame
+        viewport repaints (constant size -> no more relayout)."""
+        if gid in self._gif_pumps:
+            return
+        mv = self._make_movie(url, GIF_MAX_OPENED)
+        if mv is None:
+            return
+        doc = self.view.document()
+        rtype = QtGui.QTextDocument.ResourceType.ImageResource
+        qurl = QtCore.QUrl(f"gif://{gid}")
+
+        def _on_frame(_i) -> None:
+            doc.addResource(rtype, qurl, mv.currentPixmap())
+            self.view.viewport().update()
+        doc.addResource(rtype, qurl, mv.currentPixmap())
+        doc.markContentsDirty(0, doc.characterCount())     # size the <img> to the gif (once)
+        mv.frameChanged.connect(_on_frame)
+        mv.start()
+        self._gif_pumps[gid] = mv
+
+    def _gif_caption(self, msg) -> str:
+        who = "you" if msg.is_self else html.escape(msg.sender)
+        colour = self._C_YOU if msg.is_self else self._C_WHISPER
+        return (f'🔒 <span style="color:{colour}"><b>{who}</b></span>'
+                f'<span style="color:{self._C_DIM}">:</span>')
+
+    def _append_gif_opened(self, msg) -> None:
+        # Place the <img> in order NOW (with a loading placeholder as its resource); animate in
+        # place when the download lands -- so messages that arrive meanwhile keep their order.
+        gid = self._gif_id(msg.gif_url)
+        self.view.document().addResource(
+            QtGui.QTextDocument.ResourceType.ImageResource,
+            QtCore.QUrl(f"gif://{gid}"), self._gif_placeholder())
+        self._append_html(self._gif_caption(msg) + f'<br><img src="gif://{gid}">')
+        self._gif_placed.add(gid)
+        if self._ensure_gif(msg.gif_url):            # already cached -> animate immediately
+            self._start_pump(gid, msg.gif_url)
+
+    def _hud_add_gif(self, msg) -> None:
+        """Add an animated GIF (with sender caption) as a fading HUD line. If it isn't cached
+        yet, show a 'loading' line in place and swap the movie in when it lands (no reseed)."""
+        line = _FadingGif(self._gif_caption(msg), self._font_px, self._font_family,
+                          self._LINGER_MS, self._FADE_MS, self._hud_remove)
+        if self._ensure_gif(msg.gif_url):
+            mv = self._make_movie(msg.gif_url, GIF_MAX_HUD)
+            if mv is not None:
+                line.set_movie(mv)
+        else:
+            self._hud_gif_by_url[msg.gif_url] = line   # fill it in when the download completes
+        self._hud_lines.append(line)
+        self._hud_layout.addWidget(line)
+        while len(self._hud_lines) > self._PASSIVE_MAX:
+            self._hud_lines.pop(0).kill()
+        self._hud_panel.setVisible(True)
+
+    def _hud_gif_loaded(self, url: str) -> None:
+        line = self._hud_gif_by_url.pop(url, None)
+        if line is None or line not in self._hud_lines:
+            return                                   # the line already faded away
+        mv = self._make_movie(url, GIF_MAX_HUD)
+        if mv is not None:
+            line.set_movie(mv)
+
     # ---- opened (full history) vs passive (fading HUD) ----
 
     def set_opened(self, opened: bool) -> None:
@@ -355,6 +519,7 @@ class Overlay(QtWidgets.QWidget):
             # the Enter hotkey actually let you type (else you'd only *see* the box).
             self.input.setFocus()
         else:
+            self._clear_pumps()                  # stop opened-view GIF animations (view hidden)
             self._render_passive()
 
     def _sync_visibility(self) -> None:
@@ -364,13 +529,13 @@ class Overlay(QtWidgets.QWidget):
             self.header.setVisible(True)         # the pill itself lives in the header
             self.body.setVisible(False)
             self.arrow.setVisible(False)
-            for b in (self.filter_btn, self.emoji_btn, self.friends_btn):
+            for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.friends_btn):
                 b.setVisible(False)
             return
         chrome = self._opened
         self.header.setVisible(chrome)           # passive -> no header/buttons
         self.arrow.setVisible(chrome)
-        for b in (self.filter_btn, self.emoji_btn, self.friends_btn):
+        for b in (self.filter_btn, self.emoji_btn, self.gif_btn, self.friends_btn):
             b.setVisible(chrome)
         self.body.setVisible(True)
         self.view.setVisible(self._opened)       # opened -> scrollable history
@@ -393,6 +558,9 @@ class Overlay(QtWidgets.QWidget):
         """A line finished fading (or is being culled): drop it from the HUD."""
         if line in self._hud_lines:
             self._hud_lines.remove(line)
+        for u, ln in list(self._hud_gif_by_url.items()):   # forget any pending-GIF ref to it
+            if ln is line:
+                del self._hud_gif_by_url[u]
         line.kill()
         if not self._hud_lines:                  # nothing left -> hide the shared panel
             self._hud_panel.setVisible(False)
@@ -401,6 +569,7 @@ class Overlay(QtWidgets.QWidget):
         for line in self._hud_lines:
             line.kill()
         self._hud_lines = []
+        self._hud_gif_by_url = {}
         self._hud_panel.setVisible(False)
 
     def _render_passive(self) -> None:
@@ -409,8 +578,12 @@ class Overlay(QtWidgets.QWidget):
         shown = [(k, p) for (k, p) in self._entries
                  if k == "sys" or self._passes(p)]
         for k, p in shown[-self._PASSIVE_MAX:]:
-            self._hud_add(self._format_system(p) if k == "sys"
-                          else self._format_message(p))
+            if k == "sys":
+                self._hud_add(self._format_system(p))
+            elif getattr(p, "is_gif", False):
+                self._hud_add_gif(p)
+            else:
+                self._hud_add(self._format_message(p))
 
     # ---- display filter (cycled by the header button) ----
     # (key, short label). 'all' = everything; 'private' = party + whispers only;
@@ -441,12 +614,16 @@ class Overlay(QtWidgets.QWidget):
     def _rebuild(self) -> None:
         """Re-render the whole transcript from stored entries under the current filter.
         System/status lines always show; chat messages are filtered."""
+        self._clear_pumps()                          # stop old GIF animations before clearing
         self.view.clear()
         for kind, payload in self._entries:
             if kind == "sys":
                 self.view.append(self._format_system(payload))
             elif self._passes(payload):
-                self.view.append(self._format_message(payload))
+                if getattr(payload, "is_gif", False):
+                    self._append_gif_opened(payload)
+                else:
+                    self.view.append(self._format_message(payload))
         bar = self.view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
@@ -462,6 +639,14 @@ class Overlay(QtWidgets.QWidget):
         self.input.insert(emoji_util.to_shortcode(ch))
         self.input.setFocus()
 
+    # ---- gif picker ----
+
+    def _open_gif_picker(self) -> None:
+        if self._gif_picker is None:
+            self._gif_picker = GifPicker(self)
+        self._gif_picker.rebuild()
+        self._gif_picker.popup(self.gif_btn)
+
     # ---- collapse / expand ----
 
     _PILL_STYLE = ("color:#8fd; font-weight:bold; background:rgba(20,24,30,235);"
@@ -476,6 +661,7 @@ class Overlay(QtWidgets.QWidget):
             self.title.setText("🔒 ▸")
             self.title.setStyleSheet(self._PILL_STYLE)
             self._hud_clear()                    # stop any in-flight HUD fades
+            self._clear_pumps()                  # stop opened-view GIF animations too
             self._sync_visibility()
             # Force the size: equal min==max makes Hyprland/Windows honor the shrink
             # (a soft resize/adjustSize is otherwise ignored, leaving a frosted box).
@@ -675,6 +861,70 @@ class _FadingLine(QtWidgets.QLabel):
         self._on_dead = None
         self._timer.stop()
         self._anim.stop()
+        mv = self.movie()                        # a GIF line: stop its animation too
+        if mv is not None:
+            mv.stop()
+        self.setParent(None)
+        self.deleteLater()
+
+
+class _FadingGif(QtWidgets.QWidget):
+    """A HUD line for a GIF: a sender caption above the animated GIF (or a 'loading' note
+    until it downloads), fading on its own timer just like _FadingLine. Kept as a small
+    composite (caption + gif labels) because a single QLabel can't show both text and a movie."""
+
+    def __init__(self, caption_html: str, font_px: int, font_family: str,
+                 linger_ms: int, fade_ms: int, on_dead) -> None:
+        super().__init__()
+        self._on_dead = on_dead
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 1, 0, 1)
+        v.setSpacing(1)
+        self._cap = QtWidgets.QLabel(caption_html)
+        self._cap.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._cap.setWordWrap(True)
+        self._cap.setStyleSheet("background:transparent; color:#e6e6e6;"
+                                f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
+        self._gif = QtWidgets.QLabel("🎞️ loading GIF…")
+        self._gif.setStyleSheet("background:transparent; color:#7a828f;"
+                                f"font-family:{_css_family(font_family)}; font-size:{font_px}px;")
+        v.addWidget(self._cap)
+        v.addWidget(self._gif)
+        self._eff = QtWidgets.QGraphicsOpacityEffect(self)
+        self._eff.setOpacity(1.0)
+        self.setGraphicsEffect(self._eff)
+        self._anim = QtCore.QPropertyAnimation(self._eff, b"opacity", self)
+        self._anim.setDuration(fade_ms)
+        self._anim.finished.connect(self._finished)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._begin_fade)
+        self._timer.start(linger_ms)
+
+    def set_movie(self, mv) -> None:
+        self._gif.setText("")
+        self._gif.setMovie(mv)
+        mv.start()
+
+    def _begin_fade(self) -> None:
+        self._anim.stop()
+        self._anim.setStartValue(self._eff.opacity())
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+
+    def _finished(self) -> None:
+        if self._eff.opacity() <= 0.01 and self._on_dead is not None:
+            cb, self._on_dead = self._on_dead, None
+            cb(self)
+
+    def kill(self) -> None:
+        self._on_dead = None
+        self._timer.stop()
+        self._anim.stop()
+        mv = self._gif.movie()
+        if mv is not None:
+            mv.stop()
         self.setParent(None)
         self.deleteLater()
 
@@ -883,3 +1133,150 @@ class FriendsPanel(QtWidgets.QWidget):
         self.move(gp)
         self.show()
         self.raise_()
+
+
+class GifPicker(QtWidgets.QWidget):
+    """Popup GIF library: save GIFs by pasting a direct URL, browse your favorites +
+    recents as thumbnails, click one to send it (encrypted) to the current recipient,
+    or ✕ to remove a favorite. No search service -- purely your own saved GIFs."""
+
+    _COLS = 3
+    _THUMB = 96
+
+    def __init__(self, overlay):
+        super().__init__(overlay, QtCore.Qt.WindowType.Popup)
+        self._ov = overlay
+        self.setStyleSheet("background:rgba(18,21,27,245);"
+                           "border:1px solid #3a4150; border-radius:8px;")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        add = QtWidgets.QHBoxLayout()
+        add.setSpacing(4)
+        self.url = QtWidgets.QLineEdit()
+        self.url.setPlaceholderText("paste a direct .gif URL, press Enter to save")
+        self.url.setStyleSheet(
+            "QLineEdit{background:rgba(10,12,16,220); color:#fff;"
+            "border:1px solid #3a4150; border-radius:6px; padding:4px;}")
+        self.url.returnPressed.connect(self._add)
+        add.addWidget(self.url, 1)
+        save = QtWidgets.QPushButton("save")
+        save.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        save.setStyleSheet(
+            "QPushButton{color:#9bf6a0; background:rgba(34,40,34,120);"
+            "border:1px solid #3a4150; border-radius:6px; padding:4px 10px;}"
+            " QPushButton:hover{background:rgba(44,60,44,180);}")
+        save.clicked.connect(self._add)
+        add.addWidget(save)
+        lay.addLayout(add)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self._host = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self._host)
+        self.grid.setSpacing(4)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.scroll.setWidget(self._host)
+        lay.addWidget(self.scroll, 1)
+
+        self._hint = QtWidgets.QLabel()
+        self._hint.setStyleSheet("color:#7a828f; font-size:11px;")
+        lay.addWidget(self._hint)
+
+        self.setFixedSize(340, 380)
+        # a thumbnail that finished downloading -> refresh the grid (if we're still open)
+        overlay._gif_ready.connect(lambda _=None: self.isVisible() and self.rebuild())
+
+    def _add(self) -> None:
+        url = self.url.text().strip()
+        if not gif_util.valid_url(url):
+            self._hint.setText("needs a direct http(s) .gif URL")
+            return
+        self.url.clear()
+        self._ov.gif_action.emit("add", url)         # app persists the favorite
+        self._ov._ensure_gif(url)                    # start caching for the thumbnail
+        self.rebuild()
+
+    def _clear(self) -> None:
+        while self.grid.count():
+            w = self.grid.takeAt(0).widget()
+            if w is not None:
+                w.deleteLater()
+
+    def rebuild(self) -> None:
+        self._clear()
+        urls = list(gif_util.favorites())
+        for u in gif_util.recents():                 # append recents not already favorited
+            if u not in urls:
+                urls.append(u)
+        for i, url in enumerate(urls):
+            self.grid.addWidget(self._tile(url), i // self._COLS, i % self._COLS)
+        self._hint.setText("click a GIF to send · ✕ removes a favorite"
+                           if urls else "no GIFs yet — paste a direct .gif URL above")
+
+    def _tile(self, url: str) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(1)
+        thumb = QtWidgets.QToolButton()
+        thumb.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        thumb.setToolTip("send this GIF")
+        thumb.setFixedSize(self._THUMB, self._THUMB)
+        thumb.setStyleSheet("QToolButton{border:1px solid #2a2f3a; border-radius:6px;"
+                            "background:rgba(10,12,16,160);}"
+                            " QToolButton:hover{border-color:#5a6a8a;}")
+        if gif_util.is_cached(url):
+            mv = self._ov._make_movie(url, self._THUMB - 6)   # static first frame as the icon
+            if mv is not None:
+                mv.jumpToFrame(0)
+                thumb.setIcon(QtGui.QIcon(mv.currentPixmap()))
+                thumb.setIconSize(mv.currentPixmap().size())
+        else:
+            thumb.setText("…")
+            self._ov._ensure_gif(url)                # download; _gif_ready refreshes us
+        thumb.clicked.connect(lambda _=False, u=url: self._send(u))
+        v.addWidget(thumb)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        fav = gif_util.is_favorite(url)
+        star = QtWidgets.QPushButton("★" if fav else "☆")
+        star.setToolTip("unfavorite" if fav else "save to favorites")
+        star.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        star.setStyleSheet("QPushButton{color:%s; background:transparent; border:none;"
+                           "font-size:12px;} QPushButton:hover{color:#fff;}"
+                           % ("#ffd479" if fav else "#7a828f"))
+        star.clicked.connect(lambda _=False, u=url, f=fav: self._toggle_fav(u, f))
+        row.addWidget(star)
+        row.addStretch(1)
+        dele = QtWidgets.QPushButton("✕")
+        dele.setToolTip("delete (remove from favorites and recents)")
+        dele.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        dele.setStyleSheet("QPushButton{color:#ff8f8f; background:transparent; border:none;"
+                           "font-size:11px;} QPushButton:hover{color:#fff;}")
+        dele.clicked.connect(lambda _=False, u=url: self._delete(u))
+        row.addWidget(dele)
+        v.addLayout(row)
+        return w
+
+    def _send(self, url: str) -> None:
+        self._ov.gif_send.emit(url)
+        self.close()
+
+    def _toggle_fav(self, url: str, is_fav: bool) -> None:
+        self._ov.gif_action.emit("unfav" if is_fav else "add", url)
+        self.rebuild()
+
+    def _delete(self, url: str) -> None:
+        self._ov.gif_action.emit("forget", url)      # purge from favorites AND recents
+        self.rebuild()
+
+    def popup(self, anchor) -> None:
+        gp = anchor.mapToGlobal(QtCore.QPoint(0, anchor.height() + 4))
+        self.move(gp)
+        self.show()
+        self.raise_()
+        self.url.setFocus()

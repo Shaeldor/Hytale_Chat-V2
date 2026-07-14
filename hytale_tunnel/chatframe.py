@@ -36,6 +36,11 @@ _RUN = re.compile(rb"\x07#([0-9a-fA-F]{6})")
 # An encrypted tunnel token embedded in a message body (single 'HX1' or chunk 'HX2').
 HX_TOKEN_RE = re.compile(r"HX[12][A-Za-z0-9+/=]{20,}")
 
+# Sentinel that marks a decrypted message as a GIF: the plaintext is "HXG1 <url>".
+# It lives INSIDE the encrypted payload, so it's only trusted on the E2E-decrypted path
+# (a GIF is just a URL sent as a normal encrypted message; overlay downloads + animates it).
+GIF_SENTINEL = "HXG1 "
+
 # Line classifiers (applied to the reconstructed text).
 _RE_WHISPER_OUT = re.compile(r"^\[To (\S+)\] (.*)$", re.DOTALL)
 _RE_WHISPER_IN = re.compile(r"^\[From (\S+)\] (.*)$", re.DOTALL)
@@ -257,3 +262,5 @@ class Msg:
     rank_color: str = ""      # game's own colour for the rank tag ('' if unknown)
     name_color: str = ""      # game's own colour for the sender name ('' if unknown)
     body_color: str = ""      # game's own colour for the message body ('' if unknown)
+    is_gif: bool = False      # a GIF message -> render the animated GIF at gif_url
+    gif_url: str = ""         # the GIF's URL (also kept in body for old-client fallback)

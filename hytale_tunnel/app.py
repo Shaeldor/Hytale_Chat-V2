@@ -16,7 +16,7 @@ import time
 
 from PyQt6 import QtCore, QtWidgets
 
-from . import chatframe, crypto, inject_client, memscan, playername, send
+from . import chatframe, crypto, gif_util, inject_client, memscan, playername, send
 from .chatframe import Msg
 from .overlay import Overlay
 
@@ -628,10 +628,25 @@ def main() -> int:
         if text.split(None, 1)[0].lower() == "/font":
             _do_font(text)                       # keep the chat focused so you can try more
             return
-        mode, friend, body = _parse_command(text, last_contact)
-        if mode == "error":
-            inbox.put((SYS, body))
-            return
+        # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
+        # the recipient's overlay detects the sentinel, downloads the URL and animates it.
+        gif_url = ""
+        if text.split(None, 1)[0].lower() == "/gif":
+            gif_url = text[len("/gif"):].strip()
+            if not gif_util.valid_url(gif_url):
+                inbox.put((SYS, "usage: /gif <direct .gif URL> (http/https)"))
+                return
+            if ui.recipient not in crypto.list_psk_friends():
+                inbox.put((SYS, "select a friend you share a key with — GIFs go over the "
+                                "encrypted channel"))
+                return
+            gif_util.push_recent(gif_url)
+            mode, friend, body = "private", ui.recipient, chatframe.GIF_SENTINEL + gif_url
+        else:
+            mode, friend, body = _parse_command(text, last_contact)
+            if mode == "error":
+                inbox.put((SYS, body))
+                return
 
         # Windows/memscan dedups own sends by token hash so the scanner doesn't show
         # our own message back as if the friend sent it. On Linux the quiche frame
@@ -651,7 +666,8 @@ def main() -> int:
             # ordering. On Windows (no stream) we echo immediately.
             if not LINUX:
                 ui.add_message(Msg(sender="you", body=body, kind="whisper_out",
-                                   is_self=True, is_tunnel=True, target=friend))
+                                   is_self=True, is_tunnel=True, target=friend,
+                                   is_gif=bool(gif_url), gif_url=gif_url))
 
             def _do_send() -> None:
                 try:
@@ -710,6 +726,17 @@ def main() -> int:
             QtCore.QTimer.singleShot(60, _focus_game)
 
     ui.submitted.connect(on_submit)
+    # GIF picker: clicking a GIF sends it (reuse the /gif path); ✕/☆ save/unsave a favorite.
+    ui.gif_send.connect(lambda url: on_submit("/gif " + url))
+
+    def _do_gif_action(action: str, url: str) -> None:
+        if action == "add":
+            gif_util.add_favorite(url)
+        elif action == "unfav":
+            gif_util.remove_favorite(url)
+        elif action == "forget":              # delete entirely (favorites AND recents)
+            gif_util.forget(url)
+    ui.gif_action.connect(_do_gif_action)
     # Empty Enter in the compose box = "dismiss": hand focus back to the game (which also
     # re-arms the Enter hotkey), so a second Enter toggles the chat closed like SUPER+SHIFT+P.
     if LINUX:

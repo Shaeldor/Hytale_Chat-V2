@@ -96,9 +96,13 @@ def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
         return None
     # The decrypted body is our own plaintext, not a game-rendered run -> no game
     # body colour for it (rank/name colour from the wire still applies).
-    return chatframe.Msg(sender=sender, body=out[1], kind=cl.kind,
+    plain = out[1]
+    is_gif = plain.startswith(chatframe.GIF_SENTINEL)
+    gif_url = plain[len(chatframe.GIF_SENTINEL):].strip() if is_gif else ""
+    return chatframe.Msg(sender=sender, body=plain, kind=cl.kind,
                          is_self=is_self, is_tunnel=True, target=cl.target,
-                         rank=cl.rank, rank_color=cl.rank_color, name_color=cl.name_color)
+                         rank=cl.rank, rank_color=cl.rank_color, name_color=cl.name_color,
+                         is_gif=is_gif, gif_url=gif_url)
 
 
 def watch(on_message, stop=None, on_ready=None, proc_holder=None,
