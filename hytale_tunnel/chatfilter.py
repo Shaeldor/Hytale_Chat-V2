@@ -55,7 +55,7 @@ CATEGORIES = [
                                     ("vote party!", "endswith"), ("vote! everyone online receives", "contains"), ("we reached 100 votes!", "endswith"), 
                                     ("all online players receive", "startswith"), ("support the server by voting:/vote", "startswith"), 
                                     ("you haven't voted yet!use /vote", "endswith"), ("you have free rewards yet to be claimed!", "contains")]),
-    ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55")]),
+    ("rules",     "Sys Info",      [("[!]", "startswith", "#ffff55"), ("reached Ascension", "contains")]),
     ("pie",       "/Pie",          [("/pie", "contains"), ("boss has spawned:", "contains"), ("was defeated! rewards paid to all who struck it.", "endswith"), ("wandered off - nobody joined the raid.", "endswith")]),
     ("welcome",   "Welcome",       [("welcome", "endswith"), ("has joined histatu for the first time! welcome!", "endswith")]),
     ("joinleave", "Join / Leave",  [("[+]", "startswith"), ("[-]", "endswith")]),
@@ -63,10 +63,14 @@ CATEGORIES = [
     ("death",     "Death",         [("was killed by", "contains")]),
     ("chatgames", "Chat Games",    [("[!]", "startswith", "#ffaa00"), ("[!] a new game has started!", "contains"), ("[!] no one answered correctly!", "endswith")]),
     ("keys",      "Key Drops",     [("[keys received]", "startswith"), ("community-wide key giveaway complete!", "startswith"), ("[key distribution]", "startswith")]),
-    ("console",   "Console Cmds",  [("[!] console activated", "startswith"), ("[!] clearing up fog! enjoy the sun!", "endswith"), ("[timer]", "startswith"), ("saving chunks & data. expect a quick lag spike!", "contains"), ("chunk saving complete!", "contains")]),
+    ("console",   "Console Cmds",  [("[!] console activated", "startswith"), ("[!] clearing up fog! enjoy the sun!", "endswith"), ("[timer]", "startswith"),
+                                    ("saving chunks & data. expect a quick lag spike!", "contains"), ("chunk saving complete!", "contains"), ("Hourly bonus:", "startswith"),
+                                    ("You received $5,000.", "startswith")]),
     ("tractor",   "Tractor",       [("tractor", "contains"), ("/farm", "contains")]),
     ("building",  "Building Event",[("histatu skyblock build event", "contains"), ("histatu build event", "startswith")]),
-    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan")]),
+    ("minigames", "Mini-Games",    [("[tnt-run]", "startswith"), ("[dac]", "startswith"), ("[tnt-tag]", "startswith"), ("[blockhunt]", "startswith"), ("[block-party]", "startswith"), ("[murder-mystery]", "startswith")]),
+    ("cleanup",   "Clean Up",      [("[!] Server cleanup in 2s...", "startswith"), ("[!] Server cleanup in 1s...", "startswith"), ("[!] Clearing dropped items and hostile entities...", "startswith")],),
+    ("invisible", "Invisible Info",[("mmoskilltree.skill", "contains"), ("better crates/lootbox", "contains"), ("", "number", "cyan"), ("", "number", "green")]),
 ]
 
 _CAT_PATTERNS = {cid: pats for cid, _label, pats in CATEGORIES}
