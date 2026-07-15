@@ -17,7 +17,7 @@ hytalecrypt genkey
 **Step 3:** Everyone in the party must register that key under the name "party" by running:
 ```cmd
 cd "C:\path\to\Hytale_Chat\Windows"
-hytalecrypt setkey party THE_KEY_YOU_SHARED
+hytalecrypt setgroupkey party THE_KEY_YOU_SHARED
 ```
 
 ## 2. Setting up a Friend Key

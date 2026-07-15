@@ -221,6 +221,15 @@ def cmd_list(args):
     else:
         print("   (none — create one with 'hytalecrypt genkey' + 'setkey <name> <key>')")
 
+    print()
+    print("=== GROUP KEYS (party) ===")
+    groups = _hc.list_groups()
+    if groups:
+        for name in groups:
+            print(f"   {name:20s}  AES {_hc.key_fingerprint(_hc.load_group_psk(name))}")
+    else:
+        print("   (none — create one with 'hytalecrypt setgroupkey party <key>')")
+
 
 def cmd_encrypt(args):
     """Encrypt a message for a friend."""
@@ -288,6 +297,21 @@ def cmd_setkey(args):
     print(f"   Saved to: {path}")
     print()
     print(f"Now: hytalecrypt senc {args.name} \"secret message\"")
+
+
+def cmd_setgroupkey(args):
+    """Store a shared key for a group/party (everyone uses the SAME key)."""
+    try:
+        path = _hc.set_group_psk(args.name, args.key)
+    except Exception as e:
+        print(f"❌ Invalid key: {e}", file=sys.stderr)
+        sys.exit(1)
+    raw = _hc.load_group_psk(args.name)
+    print(f"✅ Shared group key stored for '{args.name}'")
+    print(f"   Key fingerprint: {_hc.key_fingerprint(raw)}  (compare with your party!)")
+    print(f"   Saved to: {path}")
+    print()
+    print(f"Now you can send party messages seamlessly!")
 
 
 def cmd_senc(args):
@@ -379,6 +403,10 @@ p_setkey = sub.add_parser("setkey", help="Store a friend's shared tunnel key")
 p_setkey.add_argument("name", help="Friend's name/alias (must match their in-game name)")
 p_setkey.add_argument("key",  help="The shared key (base64, from genkey)")
 
+p_setgroupkey = sub.add_parser("setgroupkey", help="Store a shared key for a party/group")
+p_setgroupkey.add_argument("name", help="Group name (e.g. 'party')")
+p_setgroupkey.add_argument("key",  help="The shared key (base64, from genkey)")
+
 p_senc  = sub.add_parser("senc",    help="Symmetric-encrypt a message (fits chat limit)")
 p_senc.add_argument("recipient", help="Friend's name (must have a shared key)")
 p_senc.add_argument("message",   help="The message to encrypt")
@@ -401,6 +429,7 @@ if __name__ == "__main__":
         "decrypt":  cmd_decrypt,
         "genkey":  cmd_genkey,
         "setkey":  cmd_setkey,
+        "setgroupkey": cmd_setgroupkey,
         "senc":    cmd_senc,
         "sdec":    cmd_sdec,
         "help":    cmd_help,
