@@ -27,7 +27,7 @@ def _parse_command(text: str, last_contact: dict, channel: str):
         return "public", None, text
     elif channel.lower() == "party":
         if crypto.load_group_psk("party") is None:
-            return "error", None, "no 'party' key set in groups. Run: hytalecrypt setkey party <key>"
+            return "error", None, "no 'party' key set in groups. Run: hytalecrypt setgroupkey party <key>"
         return "party_private", "party", text
     else:
         # A specific friend is selected
