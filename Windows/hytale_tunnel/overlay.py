@@ -1225,6 +1225,16 @@ class FriendsPanel(QtWidgets.QWidget):
             " QPushButton:hover{background:rgba(44,49,60,150); border-radius:5px;}")
         pick.clicked.connect(lambda _=False, n=name: self._emit("select", n))
         h.addWidget(pick, 1)
+        
+        inv = QtWidgets.QPushButton("🎉")
+        inv.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        inv.setToolTip("invite to party")
+        inv.setStyleSheet(
+            "QPushButton{color:#ffc552; background:transparent; border:none; padding:3px 6px;}"
+            " QPushButton:hover{background:rgba(70,60,40,180); border-radius:5px;}")
+        inv.clicked.connect(lambda _=False, n=name: self._emit("invite", n))
+        h.addWidget(inv)
+        
         rm = QtWidgets.QPushButton("✕")
         rm.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         rm.setToolTip("remove friend")

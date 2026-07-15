@@ -7,6 +7,7 @@ import argparse
 import os
 import queue
 import signal
+import base64
 import html
 import sys
 import threading
@@ -254,6 +255,22 @@ def main() -> int:
                                         ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
                             continue  # don't display the raw token (whether inbound or outbound)
 
+                        if payload.body.startswith(r"\party_invite "):
+                            if payload.kind == "whisper_in":
+                                parts = payload.body.split()
+                                if len(parts) == 3:
+                                    gname = parts[1]
+                                    gb64 = parts[2]
+                                    try:
+                                        raw_key = base64.b64decode(gb64)
+                                        if len(raw_key) == 32:
+                                            crypto.set_group_psk(gname, gb64)
+                                            ui.add_system_html(f'<span style="color:#7ec8ff;">🎉 <b>{html.escape(payload.sender)}</b> invited you to the party! You joined securely.</span>')
+                                            ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                                    except Exception:
+                                        pass
+                            continue  # hide the invite payload from chat view
+
                     ui.add_message(payload)
                     if payload.kind == "whisper_in" and not payload.is_self:
                         last_contact["name"] = payload.sender
@@ -268,9 +285,12 @@ def main() -> int:
         text = text.strip()
         if not text:
             return
-        # Intercept friend commands typed in chat
+        # Intercept commands typed in chat
         if text.lower().startswith(r"\friend "):
             _do_friend(text)
+            return
+        if text.lower().startswith(r"\party "):
+            _do_party(text)
             return
 
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
@@ -479,11 +499,52 @@ def main() -> int:
         elif action == "forget":
             gif_util.forget(url)
 
+    def _do_party(text: str) -> None:
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "invite":
+            friend = parts[2] if len(parts) > 2 else ""
+            if not friend:
+                inbox.put((SYS, r"usage: \party invite <friend> [party_name]"))
+                return
+            group_name = parts[3] if len(parts) > 3 else "party"
+            
+            group_key = crypto.load_group_psk(group_name)
+            if not group_key:
+                inbox.put((SYS, f"No group key for '{group_name}'. Set it up first using the CLI!"))
+                return
+            
+            key_b64 = base64.b64encode(group_key).decode("utf-8")
+            payload = f"\\party_invite {group_name} {key_b64}"
+            
+            try:
+                enc = crypto.encrypt_sym(friend, payload)
+            except KeyError:
+                inbox.put((SYS, f"You must be friends with {friend} first! Run \\friend add {friend}"))
+                return
+                
+            def _send_line(msg):
+                if injector:
+                    injector.send("public", None, msg)
+                else:
+                    send.send_public(msg, open_key=args.open_key, paste_method=args.paste_method, type_delay_ms=args.type_delay)
+                    
+            _send_line(f"/msg {friend} {enc}")
+            inbox.put((SYS, f"Party invite for '{group_name}' sent to {friend}!"))
+        else:
+            inbox.put((SYS, r"usage: \party invite <friend> [party_name]"))
+
     ui.custom_encrypt_requested.connect(on_custom_encrypt)
     ui.custom_decrypt_requested.connect(on_custom_decrypt)
     ui.submitted.connect(on_submit)
     ui.dismissed.connect(send.focus_game)
-    ui.friend_action.connect(lambda action, nm: _do_friend(rf"\friend {action} {nm}"))
+    def _handle_friend_action(action: str, nm: str):
+        if action == "invite":
+            _do_party(rf"\party invite {nm}")
+        else:
+            _do_friend(rf"\friend {action} {nm}")
+            
+    ui.friend_action.connect(_handle_friend_action)
     ui.gif_action.connect(_do_gif_action)
     ui.gif_send.connect(lambda url: on_submit(r"\gif " + url))
 

@@ -1,1 +1,1 @@
-QWindowsWindow::setGeometry: Unable to set geometry 132x111+55+58 (frame: 132x111+55+58) on QWidgetWindow/"OverlayClassWindow" on "MSI MAG272CQR". Resulting geometry: 132x212+55+58 (frame: 132x212+55+58) margins: 0, 0, 0, 0)
+QWindowsWindow::setGeometry: Unable to set geometry 132x111+55+58 (frame: 132x111+55+58) on QWidgetWindow/"OverlayClassWindow" on "MSI MAG272CQR". Resulting geometry: 132x195+55+58 (frame: 132x195+55+58) margins: 0, 0, 0, 0)
