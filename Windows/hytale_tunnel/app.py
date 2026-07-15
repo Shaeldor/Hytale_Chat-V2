@@ -111,6 +111,7 @@ def main() -> int:
         print(f"Marked {n} message(s) as seen; they won't appear in the overlay.")
         return 0
 
+    crypto.ensure_dirs()
     friends = crypto.list_psk_friends()
     if not friends:
         print("No shared keys yet. Set one up:\n"

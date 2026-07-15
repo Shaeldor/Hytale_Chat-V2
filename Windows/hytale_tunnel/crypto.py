@@ -43,6 +43,16 @@ def ensure_dirs() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     FRIENDS_DIR.mkdir(parents=True, exist_ok=True)
     GROUPS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    import shutil
+    legacy_party = FRIENDS_DIR / "party.key"
+    if legacy_party.exists():
+        new_party = GROUPS_DIR / "party.key"
+        if not new_party.exists():
+            shutil.move(str(legacy_party), str(new_party))
+        else:
+            legacy_party.unlink(missing_ok=True)
+        (FRIENDS_DIR / "party.pub").unlink(missing_ok=True)
 
 
 def load_privkey(path: Path = MY_PRIV_PATH) -> RSAPrivateKey:
