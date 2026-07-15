@@ -298,8 +298,8 @@ def main() -> int:
                                '\\friend add &lt;player&gt; — Send a friend request<br>'
                                '\\friend accept &lt;player&gt; — Accept a request<br>'
                                '\\friend remove &lt;player&gt; — Remove a friend<br>'
-                               '\\party create [name] — Create a new party<br>'
-                               '\\party invite &lt;friend&gt; [name] — Invite friend to party<br>'
+                               '\\party create — Create a new party<br>'
+                               '\\party invite &lt;friend&gt; — Invite friend to party<br>'
                                '\\gif &lt;url&gt; — Send an encrypted GIF</span>')
             return
 
@@ -514,21 +514,21 @@ def main() -> int:
         sub = parts[1].lower() if len(parts) > 1 else ""
         
         if sub == "create":
-            group_name = parts[2] if len(parts) > 2 else "party"
+            group_name = "party"
             import os, base64
             from . import crypto
             key_b64 = base64.b64encode(os.urandom(32)).decode("utf-8")
             crypto.set_group_psk(group_name, key_b64)
-            inbox.put((SYS, f"Created new party '{group_name}'! Invite friends with \\party invite <friend>"))
+            inbox.put((SYS, f"Created new party! Invite friends with \\party invite <friend>"))
             ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
             return
             
         if sub == "invite":
             friend = parts[2] if len(parts) > 2 else ""
             if not friend:
-                inbox.put((SYS, r"usage: \party invite <friend> [party_name]"))
+                inbox.put((SYS, r"usage: \party invite <friend>"))
                 return
-            group_name = parts[3] if len(parts) > 3 else "party"
+            group_name = "party"
             
             group_key = crypto.load_group_psk(group_name)
             if not group_key:
