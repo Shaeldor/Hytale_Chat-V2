@@ -327,7 +327,7 @@ class Overlay(QtWidgets.QWidget):
     _C_PARTY = "#ffd479"      # party chat (amber)
     _C_EMOTE = "#b9a9ff"      # /me emotes (purple)
     _C_DIM = "#7a828f"        # connectives ("whispers:", "to")
-    _C_SYS = "#888"           # server/console lines
+    _C_SYS = "#7ec8ff"        # server/console lines
 
     # ---- dynamic display tuning ----
     _FADE_MS = 900          # per-line fade-out animation length
