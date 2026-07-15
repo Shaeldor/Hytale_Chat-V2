@@ -134,7 +134,7 @@ def main() -> int:
 
     my_name = playername.detect(args.me)
 
-    SYS, MSG = object(), object()
+    SYS, SYS_HTML, MSG = object(), object(), object()
     inbox: queue.Queue = queue.Queue()
     stop = threading.Event()
     proc_holder: list = []               # holds the elevated capture process (Linux)
@@ -148,7 +148,7 @@ def main() -> int:
             target=receiver_quiche.watch,
             kwargs=dict(
                 on_message=lambda m: inbox.put((MSG, m)),
-                on_ready=lambda: inbox.put((SYS, "ready — capturing chat (quiche)")),
+                on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Capturing Chat</span>')),
                 stop=stop, proc_holder=proc_holder, my_name=my_name,
                 show_system=args.show_system, tunnel_only=args.tunnel_only,
                 debug_log=os.environ.get("HYTALE_DEBUG")),
@@ -167,7 +167,7 @@ def main() -> int:
                 target=receiver_quiche_win.watch,
                 kwargs=dict(
                     on_message=lambda m: inbox.put((MSG, m)),
-                    on_ready=lambda: inbox.put((SYS, "ready — capturing chat (quiche)")),
+                    on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Capturing Chat</span>')),
                     stop=stop, proc_holder=proc_holder, my_name=my_name,
                     show_system=args.show_system, tunnel_only=args.tunnel_only,
                     debug_log=os.environ.get("HYTALE_DEBUG")),
@@ -197,7 +197,7 @@ def main() -> int:
                 target=memscan.watch,
                 kwargs=dict(
                     on_message=_memscan_on_message,
-                    on_ready=lambda: inbox.put((SYS, "ready — watching for messages")),
+                    on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Watching for Messages</span>')),
                     interval=args.interval, sweep_interval=args.sweep,
                     max_region=args.max_region, seen=seen, workers=args.workers, stop=stop),
                 daemon=True,
@@ -232,6 +232,8 @@ def main() -> int:
                 tag, payload = inbox.get_nowait()
                 if tag is SYS:
                     ui.add_system(payload)
+                elif tag is SYS_HTML:
+                    ui.add_system_html(payload)
                 else:
                     ui.add_message(payload)
                     if payload.kind == "whisper_in" and not payload.is_self:
@@ -475,10 +477,11 @@ def main() -> int:
     instructions = (
         '<span style="color:#00d8ff; font-weight:bold;">TUNNEL UP</span><br>'
         f'<span style="color:#8fd;">Friends: {", ".join(friends) if friends else "None"}</span><br>'
-        '<span style="color:#7a8190; font-size:12px;">'
+        '<span style="color:#ffffff; font-size:12px;">'
         f'{_fmt_hk(args.hotkey_open)} - Open Chat<br>'
         f'{_fmt_hk(args.hotkey_close)} - Minimize Tunnel<br>'
-        f'{_fmt_hk(args.hotkey_unfocus)} - Game Focus'
+        f'{_fmt_hk(args.hotkey_unfocus)} - Game Focus<br>'
+        '\\gif "Link" - Send GIF'
         '</span>'
     )
     ui.add_system_html(instructions)

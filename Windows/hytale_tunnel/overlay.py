@@ -106,7 +106,7 @@ class Overlay(QtWidgets.QWidget):
         self._hud_gif_by_url = {}    # url -> _FadingGif HUD line awaiting its download
         self._gif_picker = None
         self._gif_ready.connect(self._on_gif_ready)
-        self._expanded_size = QtCore.QSize(440, 320)
+        self._expanded_size = QtCore.QSize(440, 600)
         self._user_moved = False
         self._drag_off = None
         self.setWindowTitle("hytale-tunnel")    # Hyprland matches this for window rules
@@ -233,7 +233,6 @@ class Overlay(QtWidgets.QWidget):
         hud_outer = QtWidgets.QVBoxLayout(self.hud)
         hud_outer.setContentsMargins(0, 0, 0, 0)
         hud_outer.setSpacing(0)
-        hud_outer.addStretch(1)                  # pin the panel to the bottom
         self._hud_panel = QtWidgets.QWidget()
         self._hud_panel.setStyleSheet(
             f"background: rgba(10,12,16,{BG_ALPHA}); border-radius:6px;")
@@ -242,14 +241,15 @@ class Overlay(QtWidgets.QWidget):
         self._hud_layout.setSpacing(1)
         self._hud_layout.addStretch(1)
         hud_outer.addWidget(self._hud_panel)
+        hud_outer.addStretch(1)                  # pin the panel to the top
         self._hud_panel.setVisible(False)        # only shown once it holds a line
         self._hud_lines = []
-        body.addWidget(self.hud, 1)
         self.input = _ComposeEdit()
         self.input.setPlaceholderText("Type your message here...")
         self.input.returnPressed.connect(self._on_submit)
         body.addWidget(self.input)
         root.addWidget(self.body, 1)
+        root.addWidget(self.hud, 1)
         self._apply_font()                       # size the transcript + input box
 
         # --- dynamic display ---
@@ -337,9 +337,7 @@ class Overlay(QtWidgets.QWidget):
     def add_message(self, msg) -> None:
         """Store + render a chatframe.Msg, honoring the current display filter."""
         self._entries.append(("msg", msg))
-        if self._collapsed:
-            pass                                 # pill: nothing to draw (unread badge below)
-        elif self._opened:
+        if not self._collapsed and self._opened:
             if self._passes(msg):
                 if getattr(msg, "is_gif", False):
                     self._append_gif_opened(msg)
@@ -397,18 +395,14 @@ class Overlay(QtWidgets.QWidget):
 
     def add_system(self, text: str) -> None:
         self._entries.append(("sys", text))
-        if self._collapsed:
-            return
-        if self._opened:
+        if not self._collapsed and self._opened:
             self._append_html(self._format_system(text))
         else:
             self._hud_add(self._format_system(text))
 
     def add_system_html(self, html_text: str) -> None:
         self._entries.append(("sys_html", html_text))
-        if self._collapsed:
-            return
-        if self._opened:
+        if not self._collapsed and self._opened:
             self._append_html(html_text)
         else:
             self._hud_add(html_text)
@@ -499,7 +493,13 @@ class Overlay(QtWidgets.QWidget):
         def _on_frame(_i) -> None:
             doc.addResource(rtype, qurl, mv.currentPixmap())
             self.view.viewport().update()
-        doc.addResource(rtype, qurl, mv.currentPixmap())
+            
+        pm = mv.currentPixmap()
+        scaled_sz = mv.scaledSize()
+        if scaled_sz.isValid() and pm.size() != scaled_sz:
+            pm = pm.scaled(scaled_sz, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            
+        doc.addResource(rtype, qurl, pm)
         doc.markContentsDirty(0, doc.characterCount())     # size the <img> to the gif (once)
         # The document relayout happens asynchronously, so we wait for the next event loop tick
         # to ensure the scrollbar's maximum has been updated before we snap it to the bottom.
@@ -510,10 +510,27 @@ class Overlay(QtWidgets.QWidget):
         self._gif_pumps[gid] = mv
 
     def _gif_caption(self, msg) -> str:
-        who = "you" if msg.is_self else html.escape(msg.sender)
-        colour = self._C_YOU if msg.is_self else self._C_WHISPER
-        return (f'🔒 <span style="color:{colour}"><b>{who}</b></span>'
-                f'<span style="color:{self._C_DIM}">:</span>')
+        name = html.escape(msg.sender)
+        lock = "🔒 " if msg.is_tunnel else ""
+        name_color = self._C_YOU if msg.is_self else (
+            _brighten(msg.rank_color or msg.name_color)
+            or (self._C_TUNNEL if msg.is_tunnel else self._C_OTHER))
+            
+        if msg.kind == "party":
+            who = "you" if msg.is_self else name
+            who_color = self._C_YOU if msg.is_self else self._C_PARTY
+            return (f'<span style="color:{self._C_PARTY}">{lock}[P] </span>'
+                    f'<span style="color:{who_color}"><b>{html.escape(who)}:</b></span>')
+        elif msg.kind == "whisper_out":
+            tgt = html.escape(msg.target or self.recipient)
+            return (f'<span style="color:{self._C_DIM}">{lock}to </span>'
+                    f'<span style="color:{self._C_WHISPER}"><b>{tgt}</b></span>'
+                    f'<span style="color:{self._C_DIM}">:</span>')
+        elif msg.kind == "whisper_in":
+            return (f'<span style="color:{self._C_WHISPER}">{lock}<b>{name}</b></span>'
+                    f'<span style="color:{self._C_DIM}"> whispers:</span>')
+        else:  # public
+            return f'<span style="color:{name_color}">{lock}<b>{name}:</b></span>'
 
     def _append_gif_opened(self, msg) -> None:
         # Place the <img> in order NOW (with a loading placeholder as its resource); animate in
@@ -583,6 +600,7 @@ class Overlay(QtWidgets.QWidget):
             self.btn_decrypt.setVisible(False)
             for b in (self.emoji_btn, self.gif_btn, self.friends_btn):
                 b.setVisible(False)
+            self.hud.setVisible(True)
             return
         chrome = self._opened
         self.header.setVisible(chrome)           # passive -> no header/buttons
@@ -631,10 +649,12 @@ class Overlay(QtWidgets.QWidget):
         """Reseed the HUD with the most recent visible lines (each starts its own fade)."""
         self._hud_clear()
         shown = [(k, p) for (k, p) in self._entries
-                 if k == "sys" or self._passes(p)]
+                 if k in ("sys", "sys_html") or self._passes(p)]
         for k, p in shown[-self._PASSIVE_MAX:]:
             if k == "sys":
                 self._hud_add(self._format_system(p))
+            elif k == "sys_html":
+                self._hud_add(p)
             elif getattr(p, "is_gif", False):
                 self._hud_add_gif(p)
             else:
@@ -714,10 +734,8 @@ class Overlay(QtWidgets.QWidget):
         if collapsed:
             self.title.setText("🔒 ▸")
             self.title.setStyleSheet(self._PILL_STYLE)
-            self._hud_clear()                    # stop any in-flight HUD fades
             self._clear_pumps()                  # stop opened-view GIF animations too
             self._sync_visibility()
-            self.hide()
         else:
             self._unread = 0
             self.title.setText("🔒 tunnel  ⠿")   # restore draggable title in expanded view

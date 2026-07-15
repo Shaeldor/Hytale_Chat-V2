@@ -293,25 +293,6 @@ def send_message(friend: str, message: str, open_key: str = "Return",
     return tokens
 
 
-def send_party(group: str, message: str, open_key: str = "Return",
-               type_delay_ms: int = 12, pre_send=None,
-               paste_method: str = "type") -> list[str]:
-    """Encrypt `message` with the party group key, send as one or more '/p chat' lines.
-
-    Long messages are split into encrypted chunks (the receiver reassembles them).
-    `pre_send(token)` is called for each token before it is sent."""
-    tokens = crypto.encrypt_group_messages(group, message)
-    focus_game()
-    time.sleep(T_SETTLE)
-    for idx, tok in enumerate(tokens):
-        if pre_send:
-            pre_send(tok)
-        _send_line(f"{crypto.PARTY_PREFIX}{tok}", open_key, type_delay_ms, paste_method)
-        if idx < len(tokens) - 1:
-            time.sleep(T_CHUNK_GAP)
-    return tokens
-
-
 def send_public(message: str, open_key: str = "Return", type_delay_ms: int = 12,
                 paste_method: str = "ctrl-v") -> str:
     """Type `message` into the in-game chat as a normal (unencrypted) public line --
