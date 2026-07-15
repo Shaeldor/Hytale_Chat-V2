@@ -541,6 +541,22 @@ def main() -> int:
     def _handle_friend_action(action: str, nm: str):
         if action == "invite":
             _do_party(rf"\party invite {nm}")
+        elif action == "leave_party":
+            from . import crypto
+            group_key = crypto.load_group_psk("party")
+            if group_key:
+                try:
+                    (crypto.GROUPS_DIR / "party.key").unlink(missing_ok=True)
+                except Exception:
+                    pass
+                inbox.put((SYS, "You left the party."))
+                ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                # Also clean up legacy friends/party.key if it exists
+                try:
+                    (crypto.FRIENDS_DIR / "party.pub").unlink(missing_ok=True)
+                    (crypto.FRIENDS_DIR / "party.key").unlink(missing_ok=True)
+                except Exception:
+                    pass
         else:
             _do_friend(rf"\friend {action} {nm}")
             

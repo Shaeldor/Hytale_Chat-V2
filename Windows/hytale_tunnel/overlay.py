@@ -808,8 +808,16 @@ class Overlay(QtWidgets.QWidget):
         self._friends = list(friends)
         self._requests = list(requests or [])
         self._update_friends_btn()
+        
+        in_party = False
+        try:
+            from . import crypto
+            in_party = crypto.load_group_psk("party") is not None
+        except Exception:
+            pass
+            
         if self._friends_panel is not None and self._friends_panel.isVisible():
-            self._friends_panel.rebuild(self._friends, self._requests, self.recipient)
+            self._friends_panel.rebuild(self._friends, self._requests, self.recipient, in_party)
             
         items = ["Public", "Party"] + [f for f in self._friends if f.lower() != "party"]
         self.recipient_box.blockSignals(True)
@@ -1194,20 +1202,29 @@ class FriendsPanel(QtWidgets.QWidget):
             if w is not None:
                 w.deleteLater()
 
-    def rebuild(self, friends: list, requests: list, recipient: str) -> None:
+    def rebuild(self, friends: list, requests: list, recipient: str, in_party: bool = False) -> None:
         self._clear_rows()
         idx = 0
-        for name in requests:
-            self.rows.insertWidget(idx, self._request_row(name)); idx += 1
-        if requests and friends:
+        
+        real_friends = [f for f in friends if f.lower() != "party"]
+        
+        if in_party:
+            self.rows.insertWidget(idx, self._party_row()); idx += 1
             sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
             sep.setStyleSheet("color:#333;")
             self.rows.insertWidget(idx, sep); idx += 1
-        if not friends:
+            
+        for name in requests:
+            self.rows.insertWidget(idx, self._request_row(name)); idx += 1
+        if requests and real_friends:
+            sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            sep.setStyleSheet("color:#333;")
+            self.rows.insertWidget(idx, sep); idx += 1
+        if not real_friends:
             empty = QtWidgets.QLabel("no friends yet — add one below")
             empty.setStyleSheet("color:#7a828f; padding:6px;")
             self.rows.insertWidget(idx, empty); idx += 1
-        for name in friends:
+        for name in real_friends:
             self.rows.insertWidget(idx, self._friend_row(name, name == recipient)); idx += 1
 
     def _request_row(self, name: str) -> QtWidgets.QWidget:
@@ -1225,6 +1242,24 @@ class FriendsPanel(QtWidgets.QWidget):
             " QPushButton:hover{background:rgba(44,60,44,180);}")
         acc.clicked.connect(lambda _=False, n=name: self._emit("accept", n))
         h.addWidget(acc)
+        return row
+
+    def _party_row(self) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(2, 2, 2, 2); h.setSpacing(4)
+        lbl = QtWidgets.QLabel("Party ✔️")
+        lbl.setStyleSheet("color:#ffd479; font-weight:bold; padding:4px;")
+        h.addWidget(lbl, 1)
+        
+        rm = QtWidgets.QPushButton("✕")
+        rm.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        rm.setToolTip("leave party")
+        rm.setStyleSheet(
+            "QPushButton{color:#ff8f8f; background:transparent; border:none; padding:3px 6px;}"
+            " QPushButton:hover{background:rgba(70,40,40,180); border-radius:5px;}")
+        rm.clicked.connect(lambda _=False: self._emit("leave_party", "party"))
+        h.addWidget(rm)
         return row
 
     def _friend_row(self, name: str, is_current: bool) -> QtWidgets.QWidget:
