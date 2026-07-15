@@ -833,7 +833,7 @@ class Overlay(QtWidgets.QWidget):
     def _open_friends_panel(self) -> None:
         if self._friends_panel is None:
             self._friends_panel = FriendsPanel(self, self._on_friend_event)
-        self._friends_panel.rebuild(self._friends, self._requests, self.recipient)
+        self.refresh_friends(self._friends, self._requests)
         self._friends_panel.popup(self.friends_btn)
 
     def _on_friend_event(self, action: str, name: str) -> None:
