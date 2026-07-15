@@ -816,7 +816,7 @@ class Overlay(QtWidgets.QWidget):
         except Exception:
             pass
             
-        if self._friends_panel is not None and self._friends_panel.isVisible():
+        if self._friends_panel is not None:
             self._friends_panel.rebuild(self._friends, self._requests, self.recipient, in_party)
             
         items = ["Public", "Party"] + [f for f in self._friends if f.lower() != "party"]
