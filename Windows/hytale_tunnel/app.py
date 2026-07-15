@@ -260,8 +260,8 @@ def main() -> int:
             if not gif_util.valid_url(gif_url):
                 inbox.put((SYS, r"usage: \gif <direct .gif URL> (http/https)"))
                 return
-            if ui.recipient in ("Public", "Party"):
-                inbox.put((SYS, "select a friend you share a key with — GIFs go over the "
+            if ui.recipient == "Public":
+                inbox.put((SYS, "select a friend or party you share a key with — GIFs go over the "
                                 "encrypted tunnel (so they shouldn't go in Public chat!)"))
                 return
             gif_util.push_recent(gif_url)
