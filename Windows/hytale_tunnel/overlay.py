@@ -790,6 +790,11 @@ class Overlay(QtWidgets.QWidget):
     def _set_recipient(self, name: str) -> None:
         self.recipient = name
         self._update_friends_btn()
+        try:
+            from . import crypto
+            (crypto.CONFIG_DIR / "last_channel.txt").write_text(name)
+        except Exception:
+            pass
 
     # ---- friends panel ----
 
@@ -805,6 +810,17 @@ class Overlay(QtWidgets.QWidget):
         self._update_friends_btn()
         if self._friends_panel is not None and self._friends_panel.isVisible():
             self._friends_panel.rebuild(self._friends, self._requests, self.recipient)
+            
+        items = ["Public", "Party"] + [f for f in self._friends if f.lower() != "party"]
+        self.recipient_box.blockSignals(True)
+        self.recipient_box.clear()
+        self.recipient_box.addItems(items)
+        self.recipient_box.blockSignals(False)
+        
+        if self.recipient in items:
+            self.recipient_box.setCurrentText(self.recipient)
+        else:
+            self.recipient_box.setCurrentText("Public")
 
     def _open_friends_panel(self) -> None:
         if self._friends_panel is None:
