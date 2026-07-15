@@ -244,6 +244,13 @@ def loaded_psks() -> list[tuple[str, bytes]]:
         k = load_psk(name)
         if k is not None:
             out.append((name, k))
+            
+    for p in GROUPS_DIR.glob("*.key"):
+        name = p.stem
+        k = load_group_psk(name)
+        if k is not None:
+            out.append((name, k))
+            
     return out
 
 
