@@ -300,7 +300,11 @@ def main() -> int:
                                '\\friend remove &lt;player&gt; — Remove a friend<br>'
                                '\\party create — Create a new party<br>'
                                '\\party invite &lt;friend&gt; — Invite friend to party<br>'
-                               '\\gif &lt;url&gt; — Send an encrypted GIF</span>')
+                               '\\gif &lt;url&gt; — Send an encrypted GIF<br>'
+                               '\\exit — Close down the tunnel</span>')
+            return
+        if text.lower() == r"\exit":
+            ui.close()
             return
 
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
