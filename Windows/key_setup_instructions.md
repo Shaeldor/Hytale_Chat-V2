@@ -7,7 +7,7 @@ The party channel allows you to encrypt messages so only your party members can 
 
 **Step 1:** Generate a random secure key. Open a Command Prompt (cmd) and run the following commands to navigate to this folder and generate the key:
 ```cmd
-cd "c:\Users\joshu\Documents\Antigravity MemBank\Hytale_Chat\Windows-Working"
+cd "C:\path\to\Hytale_Chat\Windows"
 hytalecrypt genkey
 ```
 (This will output a long string of random characters, like "k+1234abcd...")
@@ -16,7 +16,7 @@ hytalecrypt genkey
 
 **Step 3:** Everyone in the party must register that key under the name "party" by running:
 ```cmd
-cd "c:\Users\joshu\Documents\Antigravity MemBank\Hytale_Chat\Windows-Working"
+cd "C:\path\to\Hytale_Chat\Windows"
 hytalecrypt setkey party THE_KEY_YOU_SHARED
 ```
 
@@ -25,7 +25,7 @@ To talk privately with a specific friend, do the same thing, but use their exact
 
 **Step 1:** Generate a key:
 ```cmd
-cd "c:\Users\joshu\Documents\Antigravity MemBank\Hytale_Chat\Windows-Working"
+cd "C:\path\to\Hytale_Chat\Windows"
 hytalecrypt genkey
 ```
 
@@ -33,7 +33,7 @@ hytalecrypt genkey
 
 **Step 3:** You run:
 ```cmd
-cd "c:\Users\joshu\Documents\Antigravity MemBank\Hytale_Chat\Windows-Working"
+cd "C:\path\to\Hytale_Chat\Windows"
 hytalecrypt setkey FriendName THE_KEY_YOU_SHARED
 ```
 (And your friend runs: `hytalecrypt setkey YourName THE_KEY_YOU_SHARED`)
