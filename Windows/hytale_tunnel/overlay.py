@@ -343,7 +343,7 @@ class Overlay(QtWidgets.QWidget):
                     self._append_gif_opened(msg)
                 else:
                     self._append_html(self._format_message(msg))
-        elif self._passes(msg) and getattr(msg, "is_tunnel", False):
+        elif getattr(msg, "is_tunnel", False):
             if getattr(msg, "is_gif", False):
                 self._hud_add_gif(msg)           # animated GIF as a fading HUD line
             else:
@@ -649,7 +649,7 @@ class Overlay(QtWidgets.QWidget):
         """Reseed the HUD with the most recent visible lines (each starts its own fade)."""
         self._hud_clear()
         shown = [(k, p) for (k, p) in self._entries
-                 if k in ("sys", "sys_html") or self._passes(p)]
+                 if k in ("sys", "sys_html") or (k == "msg" and getattr(p, "is_tunnel", False))]
         for k, p in shown[-self._PASSIVE_MAX:]:
             if k == "sys":
                 self._hud_add(self._format_system(p))
