@@ -503,6 +503,17 @@ def main() -> int:
     def _do_party(text: str) -> None:
         parts = text.split()
         sub = parts[1].lower() if len(parts) > 1 else ""
+        
+        if sub == "create":
+            group_name = parts[2] if len(parts) > 2 else "party"
+            import os, base64
+            from . import crypto
+            key_b64 = base64.b64encode(os.urandom(32)).decode("utf-8")
+            crypto.set_group_psk(group_name, key_b64)
+            inbox.put((SYS, f"Created new party '{group_name}'! Invite friends with \\party invite <friend>"))
+            ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+            return
+            
         if sub == "invite":
             friend = parts[2] if len(parts) > 2 else ""
             if not friend:
