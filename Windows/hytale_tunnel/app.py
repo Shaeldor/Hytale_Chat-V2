@@ -7,6 +7,7 @@ import argparse
 import os
 import queue
 import signal
+import html
 import sys
 import threading
 
@@ -235,6 +236,24 @@ def main() -> int:
                 elif tag is SYS_HTML:
                     ui.add_system_html(payload)
                 else:
+                    if payload.kind in ("whisper_in", "whisper_out"):
+                        hs = crypto.parse_hs_token(payload.body)
+                        if hs:
+                            marker, their_pub = hs
+                            if payload.kind == "whisper_in":
+                                if marker == crypto.HS_ADD:
+                                    crypto.record_incoming_request(payload.sender, their_pub)
+                                    ui.add_system_html(f'<span style="color:#7ec8ff;">❗ Friend request from <b>{html.escape(payload.sender)}</b> — type <code>\\friend accept {html.escape(payload.sender)}</code></span>')
+                                    ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                                elif marker == crypto.HS_ACCEPT:
+                                    if crypto.has_outgoing_request(payload.sender):
+                                        crypto.clear_outgoing_request(payload.sender)
+                                        key = crypto.save_derived_friend_key(payload.sender, their_pub)
+                                        ui.add_system_html(f'<span style="color:#7ec8ff;">❗ Friend request accepted! You are now securely connected to <b>{html.escape(payload.sender)}</b>. '
+                                                      f'(Key fingerprint: {crypto.key_fingerprint(key)})</span>')
+                                        ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                            continue  # don't display the raw token (whether inbound or outbound)
+
                     ui.add_message(payload)
                     if payload.kind == "whisper_in" and not payload.is_self:
                         last_contact["name"] = payload.sender

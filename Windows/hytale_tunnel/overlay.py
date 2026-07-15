@@ -343,7 +343,7 @@ class Overlay(QtWidgets.QWidget):
                     self._append_gif_opened(msg)
                 else:
                     self._append_html(self._format_message(msg))
-        elif self._passes(msg):
+        elif self._passes(msg) and getattr(msg, "is_tunnel", False):
             if getattr(msg, "is_gif", False):
                 self._hud_add_gif(msg)           # animated GIF as a fading HUD line
             else:

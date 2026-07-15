@@ -1,4 +1,4 @@
-# Hytale Chat Windows Overlay v6.2
+# Hytale Chat Windows Overlay v6.3
 
 This project is a Windows overlay client that allows end-to-end encrypted messaging via Hytale's native chat. 
 Because Hytale chat doesn't support encryption or rich media (like GIFs and Emojis) natively, this overlay floats above the game, intercepting and decrypting messages specifically meant for you.
