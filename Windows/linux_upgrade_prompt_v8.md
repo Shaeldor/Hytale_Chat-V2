@@ -1,4 +1,4 @@
-Here is a prompt you can give to an AI to upgrade your Linux version of Hytale_Chat with the V7.0 Friend and Party logic!
+Here is a prompt you can give to an AI to upgrade your Linux version of Hytale_Chat with the V8.0 Friend and Party logic!
 
 ---
 
