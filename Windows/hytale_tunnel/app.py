@@ -293,6 +293,15 @@ def main() -> int:
         if text.lower().startswith(r"\party "):
             _do_party(text)
             return
+        if text.lower() == r"\help":
+            ui.add_system_html('<span style="color:#ffffff;"><b>Available Commands:</b><br>'
+                               '\\friend add &lt;player&gt; — Send a friend request<br>'
+                               '\\friend accept &lt;player&gt; — Accept a request<br>'
+                               '\\friend remove &lt;player&gt; — Remove a friend<br>'
+                               '\\party create [name] — Create a new party<br>'
+                               '\\party invite &lt;friend&gt; [name] — Invite friend to party<br>'
+                               '\\gif &lt;url&gt; — Send an encrypted GIF</span>')
+            return
 
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
         # the receiver overlay sees the magic bytes and displays it as a GIF.
