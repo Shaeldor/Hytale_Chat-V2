@@ -4,6 +4,7 @@ Run via the `hytale-tunnel` launcher (which puts ~/.local/lib on PYTHONPATH).
 """
 
 import argparse
+import base64
 import json
 import os
 import queue
@@ -525,6 +526,65 @@ def main() -> int:
             inbox.put((SYS, msg))
         ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
 
+    # --- /party: create a shared party key and hand it to friends over encrypted DMs ---
+    # Wire-compatible with the Windows client: the invite rides a normal encrypted whisper
+    # whose *decrypted* body is the literal line "\party_invite <group> <b64key>". The group
+    # is the single hardcoded party named "party" (both clients agree on this).
+    _PARTY_GROUP = "party"
+    _INVITE_PREFIX = "\\party_invite "
+
+    def _do_party(text: str) -> None:
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "create":
+            crypto.set_group_psk(_PARTY_GROUP, crypto.gen_psk())
+            inbox.put((SYS, "created a new party — invite friends with: /party invite <friend>"))
+            ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+            return
+        if sub == "invite":
+            friend = parts[2] if len(parts) > 2 else ""
+            if not friend:
+                inbox.put((SYS, "usage: /party invite <friend>"))
+                return
+            key = crypto.load_group_psk(_PARTY_GROUP)
+            if key is None:
+                inbox.put((SYS, "no party yet — create one first with: /party create"))
+                return
+            payload = f"{_INVITE_PREFIX}{_PARTY_GROUP} {base64.b64encode(key).decode()}"
+            try:
+                enc = crypto.encrypt_sym(friend, payload)   # single HX1 token, per-friend key
+            except KeyError:
+                inbox.put((SYS, f"you must be friends with {friend} first — run: /friend add {friend}"))
+                return
+            _send_line(f"/msg {friend} {enc}")               # send the ciphertext as a normal whisper
+            inbox.put((SYS, f"party invite sent to {friend}"))
+            return
+        inbox.put((SYS, "usage: /party create | /party invite <friend>"))
+
+    def _do_help() -> None:
+        inbox.put((SYS,
+                   "commands — /msg <friend> <msg> · /r <msg> (reply) · /p <msg> (party) · "
+                   "/friend add|accept|remove <player> · /party create · "
+                   "/party invite <friend> · /font <family> · /theme <name>"))
+
+    def _maybe_party_invite(msg) -> bool:
+        """If `msg` is a '\\party_invite <group> <b64key>' line, join that party and swallow it
+        (never display the raw invite). Mirrors the Windows receive path."""
+        if not msg.body.startswith(_INVITE_PREFIX):
+            return False
+        if msg.kind == "whisper_in" and not msg.is_self:     # act only on a friend's inbound invite
+            parts = msg.body.split()
+            if len(parts) == 3:
+                gname, gb64 = parts[1], parts[2]
+                try:
+                    if len(base64.b64decode(gb64)) == crypto.KEY_LEN:
+                        crypto.set_group_psk(gname, gb64)
+                        inbox.put((SYS, f"{msg.sender} invited you to the party — you joined securely"))
+                        ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                except Exception:                            # noqa: BLE001
+                    pass
+        return True                                          # hide the invite payload (incl. our own echo)
+
     def _maybe_handshake(msg) -> bool:
         """If `msg` is an X25519 handshake line, process it and return True (swallow it)."""
         if msg.kind not in ("whisper_in", "whisper_out"):
@@ -590,6 +650,8 @@ def main() -> int:
                     ui.add_system(payload)
                 elif _maybe_handshake(payload):
                     continue                     # /friend handshake -> consumed, not shown
+                elif _maybe_party_invite(payload):
+                    continue                     # /party invite -> joined + hidden
                 else:
                     ui.add_message(payload)
                     if payload.kind == "whisper_in" and not payload.is_self:
@@ -663,6 +725,16 @@ def main() -> int:
             _do_friend(text)
             if LINUX:
                 QtCore.QTimer.singleShot(60, _focus_game)
+            return
+        # /party and /help also accept the Windows client's backslash form (\party, \help),
+        # so following your friend's docs verbatim can't accidentally leak into public chat.
+        if text.split(None, 1)[0].lower() in ("/party", "\\party"):
+            _do_party(text)
+            if LINUX:
+                QtCore.QTimer.singleShot(60, _focus_game)
+            return
+        if text.split(None, 1)[0].lower() in ("/help", "\\help"):
+            _do_help()                           # keep the chat focused so you can read it
             return
         if text.split(None, 1)[0].lower() == "/font":
             _do_font(text)                       # keep the chat focused so you can try more

@@ -41,6 +41,35 @@ def _elevate_cmd() -> list[str]:
     return [py, _CAPTURE, me]
 
 
+_MAX_FRAME = 1 << 20        # sanity cap; a real chat frame is a few KB
+
+
+def _hold_split_frame(raw: bytes) -> bytes:
+    """If the LAST d2 chat frame in `raw` is incomplete -- its declared length runs past the
+    end of the buffer -- return that trailing fragment so the caller can stitch it onto the
+    next stream_recv read; else b''.
+
+    A frame is [u32 LE body_len][u32 type d2..][body], so it starts 4 bytes before the d2
+    signature and spans 8 + body_len bytes. quiche_conn_stream_recv delivers the QUIC byte
+    stream in chunks that don't respect these frame boundaries, so a long line (a big GIF
+    chunk, the 20-name player list) routinely straddles two reads -- and parsing each read
+    in isolation dropped or mangled it. Stitching makes the receive reliable regardless of
+    how the stream was chunked.
+    """
+    last = None
+    for m in chatframe._FAMILY_SIG.finditer(raw):
+        last = m.start()
+    if last is None or last < 4:
+        return b""
+    fstart = last - 4
+    blen = int.from_bytes(raw[fstart:fstart + 4], "little")
+    if blen <= 0 or blen > _MAX_FRAME:
+        return b""                          # implausible length -> don't hold (avoid desync)
+    if fstart + 8 + blen > len(raw):        # frame extends past this buffer -> incomplete
+        return raw[fstart:]
+    return b""
+
+
 def _rescue_party(cl: chatframe.ChatLine, keyed) -> chatframe.ChatLine:
     """Rescue an encrypted party/chat line we didn't classify as a player line.
 
@@ -137,6 +166,7 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
     if on_ready:
         on_ready()
     reasm = crypto.Reassembler()
+    carry = b""                              # held tail of a chat frame split across reads
     try:
         for line in proc.stdout:
             if stop is not None and stop.is_set():
@@ -148,6 +178,17 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 raw = bytes.fromhex(line[2:])
             except ValueError:
                 continue
+            # Stitch a chat frame that straddled two stream_recv reads: prepend any held
+            # tail, then hold back this buffer's own trailing incomplete frame (if any) for
+            # the next read. Bounded by _MAX_FRAME so a lost read can't grow carry forever.
+            if carry:
+                raw = carry + raw
+                carry = b""
+            carry = _hold_split_frame(raw)
+            if carry:
+                raw = raw[:len(raw) - len(carry)]
+                if len(carry) > _MAX_FRAME:  # frame never completed (e.g. a dropped read)
+                    carry = b""
             # One stream-0 buffer can pack several chat lines at various offsets.
             lines = chatframe.parse_all(raw)
             if dbg:
@@ -156,6 +197,25 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 ascii_preview = _re.sub(rb"[^\x20-\x7e]", b".", raw).decode()
                 _log("BUF", f"n={len(raw)}", f"sigs={nsig}",
                      f"lines={len(lines)}", ascii_preview[:1500])
+                # TRUNCATION CHECK: each d2 frame is [u32 LE body_len][u32 type d2..][body].
+                # The frame starts 4 bytes before the signature; if its declared extent runs
+                # past the captured buffer, the eBPF window clipped its tail -> lost/short line.
+                for _m in chatframe._SIG_RE.finditer(raw):
+                    fstart = _m.start() - 4
+                    if fstart < 0:
+                        continue
+                    blen = int.from_bytes(raw[fstart:fstart + 4], "little")
+                    fend = fstart + 8 + blen
+                    if 0 < blen < 1_000_000 and fend > len(raw):
+                        _log("TRUNC", f"fstart={fstart}", f"declared_body={blen}",
+                             f"frame_end={fend}", f"buf={len(raw)}", f"short_by={fend - len(raw)}")
+                # PARTYHEX: full buffer hex whenever a party line — or any non-player line that
+                # still carries an HX token (the suspected duplicate "notification" frame) — is
+                # present, so we can see exactly how the notification frame differs from the chat.
+                if any(cl.kind == "party" or
+                       (cl.kind not in _PLAYER_KINDS and chatframe.HX_TOKEN_RE.search(cl.full))
+                       for cl in lines):
+                    _log("PARTYHEX", f"kinds={[cl.kind for cl in lines]}", raw.hex())
                 # Capture hex of CHAT-LIKE buffers we currently MISS (a colour run and a
                 # "name: " colon present, but no d2 signature) to learn the alt format.
                 if nsig == 0 and b"\x07#" in raw and b": " in raw:
@@ -182,7 +242,8 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 # Log the per-run colour segments too (text + '#rrggbb') so a capture reveals the
                 # exact colours of markers like "[!]" -- what colour chat-filter rules need.
                 _runs = [(t[:16], c) for t, c in (msg.body_runs or [])][:10]
-                _log("EMIT", msg.kind, msg.sender, repr(msg.body[:80]), "runs=" + repr(_runs))
+                _log("EMIT", msg.kind, msg.sender, repr(msg.body[:80]),
+                     "full=" + repr(cl.full[:120]), "runs=" + repr(_runs))
                 on_message(msg)
     finally:
         try:

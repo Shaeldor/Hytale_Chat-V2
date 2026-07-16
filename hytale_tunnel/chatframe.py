@@ -26,8 +26,13 @@ CATEGORIES (from real traffic)
 import re
 from dataclasses import dataclass, field
 
-# Chat-log message type signature: header[4]==0xd2, header[8]==0x01, header[10]==0x40.
+# Every stream-0 message is framed as [u32 LE body_len][u32 LE type][body]; the type
+# byte sits at offset 4. 0xD2 is a rendered chat-log line (what we display). 0xD4 is a
+# party-chat NOTIFICATION echo -- a separate frame carrying the literal wire text
+# "[Party] <name>: <token>" that DUPLICATES the real 0xD2 party line (verified against
+# captured traffic). We drop 0xD4 so party messages aren't shown twice.
 TYPE_OFF, TYPE_B = 4, 0xD2
+NOTIF_TYPE_B = 0xD4
 SUB1_OFF, SUB1_B = 8, 0x01
 SUB2_OFF, SUB2_B = 10, 0x40
 
@@ -116,6 +121,12 @@ def _color_at(runs: list[tuple[str, str]], pos: int) -> str:
 # packed chat messages from being silently dropped).
 SIG = bytes([TYPE_B, 0, 0, 0, SUB1_B, 0, SUB2_B])   # d2 00 00 00 01 00 40
 _SIG_RE = re.compile(re.escape(SIG))
+
+# Chat-FAMILY signature: a rendered chat-log line (d2) OR a party-notification echo (d4),
+# both framed as "<type> 00 00 00 01 00" at offset 4. We locate frames by this (matching
+# both types, and NOT requiring the trailing 0x40 sub-byte -- some genuine d2 chat frames
+# carry a different sub-byte and were being missed) then keep only d2 and drop d4.
+_FAMILY_SIG = re.compile(rb"[\xd2\xd4]\x00\x00\x00\x01\x00")
 
 
 def is_chat_frame(raw: bytes) -> bool:
@@ -312,31 +323,28 @@ def parse(raw: bytes) -> ChatLine | None:
 
 
 def parse_all(raw: bytes) -> list[ChatLine]:
-    """Extract EVERY chat line packed into one QUIC stream-0 buffer.
+    """Extract every DISPLAYABLE chat line from one QUIC stream-0 buffer.
 
-    The game coalesces multiple framed messages into a single stream_recv read, so a
-    chat line can sit at any offset (and several can share a buffer). We locate each
-    chat-log signature and parse the run region between it and the next one. Segments
-    that hold no rich-text runs (a spurious signature match in binary/compressed data)
-    are skipped.
+    Stream 0 packs frames of MANY types, each ``[u32 len][u32 type][body]``. Only a type
+    **0xD2** frame is a rendered chat-log line the player sees in-game -- so that is the
+    reliable "is this real chat?" gate. Type **0xD4** is a party-chat NOTIFICATION echo
+    that duplicates the real d2 party line -> dropped. Everything else (combat/pet flavor
+    like "Swiftfang: the flurry peaks.", MMO HUD/skill/entity data) is NOT chat and is
+    dropped by simply not matching the chat-family signature.
+
+    Frames are located by that signature and split at the NEXT one, so a d4 notification
+    packed in the same buffer as real d2 chat is separated out and dropped cleanly rather
+    than merged into the chat line (which was leaving ~20-30% of party messages doubled).
     """
-    offsets = [m.start() for m in _SIG_RE.finditer(raw)]
+    marks = [(m.start(), raw[m.start()]) for m in _FAMILY_SIG.finditer(raw)]
+    starts = [off for off, _ in marks]
     lines: list[ChatLine] = []
-    if not offsets:
-        # No d2 chat-log signature in this buffer -- but some chat lines arrive in a
-        # variant framing WITHOUT the d2 header (they still carry \x07#colour runs).
-        # Previously these were silently dropped (the "MISSHEX" case); recover the line
-        # from its runs so every message is displayed.
-        runs = parse_runs(raw)
-        if runs:
-            full = "".join(t for t, _ in runs)
-            if _looks_like_text(full):
-                lines.append(classify(full, runs))
-        return lines
-    for i, off in enumerate(offsets):
-        end = offsets[i + 1] if i + 1 < len(offsets) else len(raw)
+    for i, (off, ftype) in enumerate(marks):
+        if ftype == NOTIF_TYPE_B:                   # d4 -> party-notification duplicate, drop
+            continue
+        end = starts[i + 1] if i + 1 < len(starts) else len(raw)
         runs = parse_runs(raw[off:end])
-        if not runs:
+        if not runs:                                # spurious signature in binary -> skip
             continue
         full = "".join(t for t, _ in runs)
         if not _looks_like_text(full):              # binary/garbage segment -> not a chat line

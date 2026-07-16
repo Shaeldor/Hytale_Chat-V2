@@ -40,6 +40,20 @@ def _split_gifs(text: str):
         segs.append(("text", text[i:]))
     return segs
 
+_ZWSP = "​"                 # zero-width space: an invisible wrap opportunity
+_LONG_TOKEN_RE = re.compile(r"\S{25,}")
+
+
+def _soft_break(text: str) -> str:
+    """Insert zero-width break opportunities into over-long UNBROKEN (space-less) runs so a
+    huge URL or an undecryptable tunnel token wraps within the overlay instead of running off
+    the right edge (Qt's word-wrap only breaks on whitespace, so a 180-char token overflowed
+    and got clipped)."""
+    return _LONG_TOKEN_RE.sub(
+        lambda m: _ZWSP.join(m.group(0)[i:i + 16] for i in range(0, len(m.group(0)), 16)),
+        text)
+
+
 # GIF display sizing (px, longest side): larger in the opened transcript, smaller in the
 # floating HUD so it stays unobtrusive over the game. Rendered as real QMovie widgets.
 GIF_MAX_OPENED = 260
@@ -517,7 +531,7 @@ class Overlay(QtWidgets.QWidget):
         out = []
         for kind, seg in _split_gifs(text):
             if kind == "text":
-                out.append(html.escape(emoji_util.emojize(seg)).replace("\n", "<br>"))
+                out.append(html.escape(_soft_break(emoji_util.emojize(seg))).replace("\n", "<br>"))
         return "".join(out).strip()
 
     def _runs_html(self, runs, drop_gifs: bool = False, bold: bool = False) -> str:
@@ -530,7 +544,7 @@ class Overlay(QtWidgets.QWidget):
             for kind, seg in pieces:
                 if kind == "gif":
                     continue
-                h = html.escape(emoji_util.emojize(seg)).replace("\n", "<br>")
+                h = html.escape(_soft_break(emoji_util.emojize(seg))).replace("\n", "<br>")
                 if not h:
                     continue
                 c = _brighten(color) if color else ""

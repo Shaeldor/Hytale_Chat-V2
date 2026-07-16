@@ -42,9 +42,28 @@ def _unescape(s: bytes) -> bytes:
     return bytes(out)
 
 
+def _is_zombie(pid: int) -> bool:
+    # A leftover "<defunct>" client (state Z) keeps the name but has no maps. pgrep
+    # lists it first (lower pid), so naively taking out[0] picks the dead one.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            return f.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+    except (OSError, IndexError):
+        return True
+
+
 def find_pid() -> int | None:
     out = subprocess.run(["pgrep", "-x", "HytaleClient"], capture_output=True, text=True).stdout.split()
-    return int(out[0]) if out else None
+    pids = [int(x) for x in out]
+    # Prefer a live client that actually has libquiche.so mapped (skips the zombie
+    # and any pre-map early-startup match); fall back to the first non-zombie.
+    for p in pids:
+        if find_libquiche(p):
+            return p
+    for p in pids:
+        if not _is_zombie(p):
+            return p
+    return pids[0] if pids else None
 
 
 def find_libquiche(pid: int) -> str | None:
@@ -103,7 +122,12 @@ def main() -> int:
     # Larger windows can trip the BPF verifier/strlen on some kernels; fall back.
     for window in (_WINDOW, 4096, 2048, 1024, 512):
         prog = _bpftrace_prog(lib, pid, window)
-        env = dict(os.environ, BPFTRACE_MAX_STRLEN=str(window))
+        # The client streams a LOT of non-chat traffic on stream 0 (MMO HUD/skill/inventory
+        # updates); at the default 64-page perf buffer a burst (raid spam + the 20-name
+        # player list + party GIF chunks) overflows the ring and silently drops events --
+        # which is how whole chat lines went missing. A larger ring absorbs the bursts.
+        env = dict(os.environ, BPFTRACE_MAX_STRLEN=str(window),
+                   BPFTRACE_PERF_RB_PAGES="512")
         master, slave = pty.openpty()
         # RAW mode: bpftrace lines (big hex buffers) must not hit the terminal's
         # canonical line-length limit, which would truncate/drop them.
@@ -128,10 +152,18 @@ def main() -> int:
 
     def _stop(*_):
         try:
-            proc.terminate()
+            proc.terminate()                     # stop the root bpftrace (don't orphan it)
         except Exception:
             pass
-        sys.exit(0)
+        # The overlay (our stdout reader) has gone away, so stdout is a broken pipe. Point
+        # fd 1 at /dev/null and hard-exit: os._exit skips the interpreter's shutdown flush,
+        # which would otherwise retry the failed flush and spew
+        # "Exception ignored while flushing sys.stdout: BrokenPipeError" to the terminal.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+        except OSError:
+            pass
+        os._exit(0)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 

@@ -57,10 +57,26 @@ def _unescape(s: bytes) -> bytes:
     return bytes(out)
 
 
+def _is_zombie(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            return f.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+    except (OSError, IndexError):
+        return True
+
+
 def find_pid() -> int | None:
     out = subprocess.run(["pgrep", "-x", "HytaleClient"],
                          capture_output=True, text=True).stdout.split()
-    return int(out[0]) if out else None
+    pids = [int(x) for x in out]
+    # Skip a leftover <defunct> zombie (lists first, no maps); prefer libquiche-mapped.
+    for p in pids:
+        if find_libquiche(p):
+            return p
+    for p in pids:
+        if not _is_zombie(p):
+            return p
+    return pids[0] if pids else None
 
 
 def find_libquiche(pid: int) -> str | None:

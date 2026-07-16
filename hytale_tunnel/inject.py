@@ -159,10 +159,36 @@ def _write_mem(tid: int, addr: int, data: bytes) -> None:
 
 # ------------------------------------------------------------------- target lookup
 
+def _is_zombie(pid: int) -> bool:
+    # A leftover "<defunct>" client (state Z) shares the name but has no maps.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            return f.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+    except (OSError, IndexError):
+        return True
+
+
+def _has_libquiche(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            return any("libquiche.so" in line for line in f)
+    except OSError:
+        return False
+
+
 def _game_pid() -> int | None:
     out = subprocess.run(["pgrep", "-x", "HytaleClient"],
                          capture_output=True, text=True).stdout.split()
-    return int(out[0]) if out else None
+    pids = [int(x) for x in out]
+    # pgrep lists the lowest pid first, which may be a leftover <defunct> zombie
+    # that has no maps. Pick the live client that actually links libquiche.so.
+    for p in pids:
+        if _has_libquiche(p):
+            return p
+    for p in pids:
+        if not _is_zombie(p):
+            return p
+    return pids[0] if pids else None
 
 
 def _quiche_send_tid(pid: int) -> int | None:

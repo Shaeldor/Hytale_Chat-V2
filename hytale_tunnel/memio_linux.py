@@ -11,12 +11,24 @@ import os
 CLIENT_NAMES = ("HytaleClient",)
 
 
+def _is_zombie(pid: str | int) -> bool:
+    # A leftover "<defunct>" client keeps its name/comm but is state Z with no maps;
+    # reading its memory yields nothing, so never return it as the live client.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            return f.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+    except (OSError, IndexError):
+        return True
+
+
 def find_client_pid() -> int | None:
     for comm_path in glob.glob("/proc/[0-9]*/comm"):
         try:
             with open(comm_path) as f:
                 if f.read().strip() in CLIENT_NAMES:
-                    return int(comm_path.split("/")[2])
+                    pid = int(comm_path.split("/")[2])
+                    if not _is_zombie(pid):
+                        return pid
         except (OSError, ValueError):
             continue
     # comm is truncated to 15 chars; fall back to argv[0].
@@ -25,7 +37,9 @@ def find_client_pid() -> int | None:
             with open(cmd_path, "rb") as f:
                 argv0 = f.read().split(b"\0", 1)[0]
             if any(argv0.endswith(b"/" + n.encode()) for n in CLIENT_NAMES):
-                return int(cmd_path.split("/")[2])
+                pid = int(cmd_path.split("/")[2])
+                if not _is_zombie(pid):
+                    return pid
         except (OSError, ValueError):
             continue
     return None
