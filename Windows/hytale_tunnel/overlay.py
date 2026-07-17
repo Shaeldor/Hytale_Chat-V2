@@ -84,6 +84,7 @@ class Overlay(QtWidgets.QWidget):
     gif_send = QtCore.pyqtSignal(str)           # a GIF url picked in the picker -> send it
     gif_action = QtCore.pyqtSignal(str, str)    # (action, url): add / remove favorite
     _gif_ready = QtCore.pyqtSignal(str)         # (url) a GIF finished downloading -> re-render
+    update_available = QtCore.pyqtSignal()      # emitted when a remote update is detected
 
     def changeEvent(self, event) -> None:
         if event.type() == QtCore.QEvent.Type.ActivationChange:
@@ -167,14 +168,16 @@ class Overlay(QtWidgets.QWidget):
         self._requests = []
         self._friends_panel = None
         self.update_btn = QtWidgets.QPushButton("📥")
-        self.update_btn.setToolTip("Update Ready!")
-        self.update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setToolTip("Checking for updates...")
+        self.update_btn.setEnabled(False)
         self.update_btn.setStyleSheet(
-            "QPushButton{color:#55ff55; background:rgba(34,34,34,40);"
-            "border:1px solid #55ff55; border-radius:4px; padding:2px 6px;}"
-            " QPushButton:hover{background:rgba(44,49,60,150);}")
+            "QPushButton{color:#888; background:rgba(34,34,34,40);"
+            "border:1px solid #555; border-radius:4px; padding:2px 6px;}")
         self.update_btn.clicked.connect(self.perform_update)
-        # The button is visible for demonstration, but you can hide it with self.update_btn.hide() by default
+        
+        self.update_available.connect(self._on_update_available)
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+        
         header.addWidget(self.update_btn)
 
         self.friends_btn = QtWidgets.QPushButton("👥")
@@ -896,6 +899,43 @@ class Overlay(QtWidgets.QWidget):
             "Paste an encrypted token (HX1...) here to decrypt it:", on_ok
         )
         self._crypto_dialog.popup(self.btn_decrypt)
+    def _on_update_available(self) -> None:
+        self.update_btn.setEnabled(True)
+        self.update_btn.setToolTip("Update Ready!")
+        self.update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet(
+            "QPushButton{color:#55ff55; background:rgba(34,34,34,40);"
+            "border:1px solid #55ff55; border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
+
+    def _check_for_updates(self) -> None:
+        import sys
+        import json
+        import urllib.request
+        
+        local_hash = None
+        if hasattr(sys, "_MEIPASS"):
+            commit_file = os.path.join(sys._MEIPASS, "commit.txt")
+            if os.path.exists(commit_file):
+                with open(commit_file, "r") as f:
+                    local_hash = f.read().strip()
+        
+        if not local_hash:
+            return
+            
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/repos/Shaeldor/Hytale_Chat-V2/commits/main",
+                headers={'User-Agent': 'Hytale-Chat-Update-Checker'}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                remote_hash = data.get("sha", "").strip()
+                
+            if remote_hash and not remote_hash.startswith(local_hash):
+                self.update_available.emit()
+        except Exception as e:
+            print(f"Failed to check for updates: {e}")
 
     def perform_update(self) -> None:
         import urllib.request
@@ -903,6 +943,7 @@ class Overlay(QtWidgets.QWidget):
         import tempfile
         import subprocess
         import sys
+        import json
 
         self.update_btn.setText("⏳")
         self.update_btn.setEnabled(False)
@@ -910,11 +951,24 @@ class Overlay(QtWidgets.QWidget):
 
         def update_thread():
             try:
-                # Replace with actual URL later
-                download_url = "https://github.com/Shaeldor/Hytale_Chat-V2/releases/download/Hytale/Compiled_HyChat.zip"
+                # Fetch the actual zip download URL from the Hytale tag release
+                api_url = "https://api.github.com/repos/Shaeldor/Hytale_Chat-V2/releases/tags/Hytale"
+                req = urllib.request.Request(api_url, headers={'User-Agent': 'Hytale-Chat-Update-Checker'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    release_data = json.loads(response.read().decode())
+                
+                download_url = None
+                for asset in release_data.get('assets', []):
+                    if asset.get('name', '').endswith('.zip'):
+                        download_url = asset.get('browser_download_url')
+                        break
+                
+                if not download_url:
+                    print("No zip asset found on the Hytale release tag!")
+                    return
                 
                 temp_dir = tempfile.gettempdir()
-                zip_path = os.path.join(temp_dir, "Compiled_HyChat.zip")
+                zip_path = os.path.join(temp_dir, "Hytale_Update.zip")
                 extract_dir = os.path.join(temp_dir, "HyChatUpdate")
                 
                 try:
@@ -930,7 +984,7 @@ class Overlay(QtWidgets.QWidget):
                 with open(bat_path, "w") as f:
                     f.write("@echo off\n")
                     f.write("timeout /t 2 /nobreak >nul\n")
-                    f.write(f'if exist "{extract_dir}" xcopy /e /y "{extract_dir}\\*" "%CD%\\"\n')
+                    f.write(f'if exist "{extract_dir}\\HyChat" ( xcopy /e /y "{extract_dir}\\HyChat\\*" "%CD%\\" ) else ( xcopy /e /y "{extract_dir}\\*" "%CD%\\" )\n')
                     f.write(f'start "" "{sys.executable}"\n')
                     f.write(f'if exist "{extract_dir}" rmdir /s /q "{extract_dir}"\n')
                     f.write(f'if exist "{zip_path}" del "{zip_path}"\n')

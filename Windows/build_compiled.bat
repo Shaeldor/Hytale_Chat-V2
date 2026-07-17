@@ -16,26 +16,29 @@ if errorlevel 1 (
 
 REM 2. Run PyInstaller compilation
 echo [1/4] Running PyInstaller...
-python -m PyInstaller --onedir --name hytale-tunnel --noconsole --distpath build_dist --workpath build_temp launcher.py
+git -C "..\Hytale_Chat_Repo" rev-parse HEAD > commit.txt
+python -m PyInstaller --onedir --name hytale-tunnel --noconsole --add-data "commit.txt;." --distpath build_dist --workpath build_temp launcher.py
 if errorlevel 1 (
     echo [ERROR] PyInstaller compilation failed.
+    if exist commit.txt del /q commit.txt
     pause
     exit /b 1
 )
+if exist commit.txt del /q commit.txt
 
-REM 3. Prepare target folder Compiled_HyChat
-echo [2/4] Preparing Compiled_HyChat folder...
-if exist Compiled_HyChat (
-    echo Cleaning up old Compiled_HyChat folder...
-    rmdir /s /q Compiled_HyChat
+REM 3. Prepare target folder HyChat
+echo [2/4] Preparing HyChat folder...
+if exist HyChat (
+    echo Cleaning up old HyChat folder...
+    rmdir /s /q HyChat
 )
-mkdir Compiled_HyChat
+mkdir HyChat
 
-REM 4. Move files to Compiled_HyChat
+REM 4. Move files to HyChat
 echo [3/4] Structuring executable files...
-xcopy /e /q /y build_dist\hytale-tunnel\* Compiled_HyChat\
+xcopy /e /q /y build_dist\hytale-tunnel\* HyChat\
 if errorlevel 1 (
-    echo [ERROR] Failed to move compiled files to Compiled_HyChat.
+    echo [ERROR] Failed to move compiled files to HyChat.
     pause
     exit /b 1
 )
@@ -50,7 +53,7 @@ del /q launcher.py
 echo.
 echo ====================================================
 echo BUILD SUCCESSFUL!
-echo Executable: Compiled_HyChat\hytale-tunnel.exe
+echo Executable: HyChat\hytale-tunnel.exe
 echo ====================================================
 echo.
 pause
