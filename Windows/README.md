@@ -1,54 +1,31 @@
-# Hytale Chat Windows Overlay v8.0
+# Hytale Chat Windows Overlay v6.4
 
 This project is a Windows overlay client that allows end-to-end encrypted messaging via Hytale's native chat. 
 Because Hytale chat doesn't support encryption or rich media (like GIFs and Emojis) natively, this overlay floats above the game, intercepting and decrypting messages specifically meant for you.
 
----
+## Features
+- **E2E Encryption**: Messages are securely encrypted using shared keys.
+- **Party & Direct Messaging**: Support for sending private whispers and group party chats.
+- **Emoji Support**: Convert emoji shortcodes (like `:smile:`) directly into visual emojis via the system font.
+- **GIF & Image Support**: Send direct `.gif` or `.webp` links in chat, and they will animate directly within your Hytale chat overlay.
+- **Seamless HUD**: Integrated directly over the Hytale UI with an opened chat view and a fading HUD for a native experience.
 
-## 🚀 Quick Start (Easiest Way to Run)
+## Recent Updates / Changelog
 
-For Windows users, we have pre-compiled the overlay into a self-contained executable. You do not need to install Python or run any setup scripts.
+- **Improved Emoji Parsing**: Fixed an issue where the text body was being incorrectly formatted; emojis now cleanly render as glyphs on both clients.
+- **Enhanced GIF & WebP Support**:
+  - Automatically detects direct `.gif` and `.webp` links in messages without needing a manual prefix, and includes `\gif` command support.
+  - Removed the legacy `HXG1` marker for full compatibility with newer Linux clients, eliminating the glitch where `HXG1` would appear as text in front of GIFs.
+  - GIF headers now correctly format the recipient's name (e.g. `🔒 to Friend:`) instead of just showing `you`.
+- **UI & Experience Upgrades**:
+  - **Always-on HUD**: The passive fading chat (HUD) now remains visible and anchored directly below the pill icon even when the chat box is minimized (`Shift+Down`).
+  - **Expanded View**: The chat window height was increased from 320px to 600px to give much more room for reading chat history.
+  - **Styling Tweaks**: Updated overlay instruction text to crisp white for better readability and styled startup connection messages in a clean green color.
+- **Bug Fixes**:
+  - Fixed a double-send glitch in party chat by reverting the prefix injection from `/party chat` back to `/p chat`.
+  - Fixed a scrolling bug where a large blank gap would appear above newly loaded GIFs; the chat view now perfectly snaps to the bottom once the GIF resolves.
+- **Automated Friend Setup**:
+  - Included a seamless key exchange system using `\friend add <name>` and `\friend accept <name>` that securely performs a Diffie-Hellman handshake over public whispers, eliminating the need to manually share passwords.
 
-1. Download the **`Compiled_HyChat`** folder.
-2. Inside it, double-click **`hytale-tunnel.exe`** to start the overlay!
-3. The overlay will launch as a overlay on top of your screen. 
-   *(Note: Make sure your game is set to **Borderless Windowed Fullscreen** in its video settings so the overlay draws on top smoothly without any black screen flashes!)*
-
----
-
-## 🎮 In-Game Commands
-
-Once the overlay is running, type these commands directly into your standard Hytale chat box to interact with the system:
-
-### Friend Management (Handshake)
-- **`\friend add <player>`**: Sends a secure friend request to a player. This will automatically execute a Diffie-Hellman cryptographic key handshake over public whispers.
-- **`\friend accept <player>`**: Accepts an incoming friend request and completes the secure key exchange.
-- **`\friend remove <player>`**: Removes a friend and deletes their shared secret key.
-
-### Group & Party Chats
-- **`\party create`**: Generates a brand new, unique 32-byte secret AES key for a secure party chat room.
-- **`\party invite <friend>`**: Encrypts and securely sends your active party key to your friend. Once they receive it, they are instantly added to your party chat!
-
-### Extras & Utilities
-- **`\gif <url>`**: Sends an encrypted GIF link. The recipient client will decrypt and animate it directly in their overlay.
-- **`\help`**: Prints this list of commands in crisp white text in your chat history.
-- **`\exit`**: Gracefully terminates the overlay, releases hotkeys, and stops all background packet capture tasks.
-
----
-
-## 🎹 Global Hotkeys (Controls)
-
-Use these keyboard shortcuts to navigate the overlay while in-game:
-*   **`Shift + Up`**: Expands the chat window so you can read history and type messages.
-*   **`Shift + Down`**: Minimizes/collapses the chat overlay back to a clean, passive HUD.
-*   **`Shift + Left`**: Unfocuses the chat overlay and returns keyboard focus back to your game window.
-
----
-
-## 🛠️ Developer Setup (For building from source)
-
-If you wish to modify the code or run it directly using a local Python interpreter:
-
-1. Double-click `setup-windows.bat` to install the required Python dependencies (`PyQt6`, `cryptography`, `frida`, `emoji`).
-2. Run the batch launcher: `hytale_tunnel\hytale-tunnel.bat -r <friend>`
-3. To re-compile the `.exe` folder yourself, run the `build_compiled.bat` script.
+## Getting Started
+To send encrypted messages, use the custom encryption popup. You can copy the generated tokens and paste them into Hytale. The overlay will automatically detect encrypted messages meant for you, decrypt them, and render them transparently over the game.

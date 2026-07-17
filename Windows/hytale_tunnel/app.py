@@ -135,6 +135,40 @@ def main() -> int:
 
     ui = Overlay(recipient, friends, font_px=font_size)
 
+    # --- System Tray Icon ---
+    tray_icon = QtWidgets.QSystemTrayIcon(app)
+    pm = QtGui.QPixmap(32, 32)
+    pm.fill(QtGui.QColor("transparent"))
+    painter = QtGui.QPainter(pm)
+    painter.setBrush(QtGui.QColor("#55ff55"))
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    painter.drawRoundedRect(2, 2, 28, 28, 6, 6)
+    painter.setPen(QtGui.QColor("#000000"))
+    font = painter.font()
+    font.setPointSize(16)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "H")
+    painter.end()
+    
+    tray_icon.setIcon(QtGui.QIcon(pm))
+    tray_icon.setToolTip("HyChat")
+    
+    tray_menu = QtWidgets.QMenu()
+    show_action = tray_menu.addAction("Show / Hide")
+    def toggle_ui():
+        if ui.isHidden():
+            ui.show()
+        else:
+            ui.hide()
+    show_action.triggered.connect(toggle_ui)
+    
+    quit_action = tray_menu.addAction("Quit")
+    quit_action.triggered.connect(app.quit)
+    
+    tray_icon.setContextMenu(tray_menu)
+    tray_icon.show()
+    # ------------------------
     my_name = playername.detect(args.me)
 
     SYS, SYS_HTML, MSG = object(), object(), object()

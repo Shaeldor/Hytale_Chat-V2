@@ -166,6 +166,17 @@ class Overlay(QtWidgets.QWidget):
         self._friends = list(friends)
         self._requests = []
         self._friends_panel = None
+        self.update_btn = QtWidgets.QPushButton("📥")
+        self.update_btn.setToolTip("Update Ready!")
+        self.update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet(
+            "QPushButton{color:#55ff55; background:rgba(34,34,34,40);"
+            "border:1px solid #55ff55; border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
+        self.update_btn.clicked.connect(self.perform_update)
+        # The button is visible for demonstration, but you can hide it with self.update_btn.hide() by default
+        header.addWidget(self.update_btn)
+
         self.friends_btn = QtWidgets.QPushButton("👥")
         self.friends_btn.setToolTip("friends — add / accept / remove")
         self.friends_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
@@ -885,6 +896,52 @@ class Overlay(QtWidgets.QWidget):
             "Paste an encrypted token (HX1...) here to decrypt it:", on_ok
         )
         self._crypto_dialog.popup(self.btn_decrypt)
+
+    def perform_update(self) -> None:
+        import urllib.request
+        import zipfile
+        import tempfile
+        import subprocess
+        import sys
+
+        self.update_btn.setText("⏳")
+        self.update_btn.setEnabled(False)
+        self.update_btn.repaint()
+
+        def update_thread():
+            try:
+                # Replace with actual URL later
+                download_url = "https://github.com/Shaeldor/Hytale_Chat-V2/releases/download/Hytale/Compiled_HyChat.zip"
+                
+                temp_dir = tempfile.gettempdir()
+                zip_path = os.path.join(temp_dir, "Compiled_HyChat.zip")
+                extract_dir = os.path.join(temp_dir, "HyChatUpdate")
+                
+                try:
+                    urllib.request.urlretrieve(download_url, zip_path)
+                except Exception:
+                    pass # Mock for testing if URL is invalid
+                
+                if os.path.exists(zip_path) and zipfile.is_zipfile(zip_path):
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(extract_dir)
+
+                bat_path = os.path.join(temp_dir, "updater.bat")
+                with open(bat_path, "w") as f:
+                    f.write("@echo off\n")
+                    f.write("timeout /t 2 /nobreak >nul\n")
+                    f.write(f'if exist "{extract_dir}" xcopy /e /y "{extract_dir}\\*" "%CD%\\"\n')
+                    f.write(f'start "" "{sys.executable}"\n')
+                    f.write(f'if exist "{extract_dir}" rmdir /s /q "{extract_dir}"\n')
+                    f.write(f'if exist "{zip_path}" del "{zip_path}"\n')
+                    f.write('del "%~f0"\n')
+                
+                subprocess.Popen([bat_path], creationflags=0x08000000) # CREATE_NO_WINDOW
+                QtCore.QMetaObject.invokeMethod(QtCore.QCoreApplication.instance(), "quit", QtCore.Qt.ConnectionType.QueuedConnection)
+            except Exception as e:
+                print(f"Update failed: {e}")
+                
+        threading.Thread(target=update_thread, daemon=True).start()
 
 
 class _ComposeEdit(QtWidgets.QLineEdit):
