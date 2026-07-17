@@ -221,7 +221,7 @@ def _build_msg(cl: chatframe.ChatLine, my_name: str | None,
                          is_gif=is_gif, gif_url=gif_url)
 
 
-def watch(on_message, stop=None, on_ready=None, proc_holder=None,
+def watch(on_message, stop=None, on_ready=None, on_disconnect=None, proc_holder=None,
           my_name=None, show_system=False, tunnel_only=False, debug_log=None,
           pid_getter=None):
     """Attach to HytaleClient and call on_message(Msg) per incoming
@@ -264,7 +264,7 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                 on_ready()
                 ready_sent = True
         elif t == "noexport":
-            on_message(chatframe.Msg(sender="·", body="quiche_conn_stream_recv not found in client", kind="system"))
+            on_message(chatframe.Msg(sender="·", body="Failed to connect, please reboot Tunnel", kind="system"))
         elif t == "buf" and _data:
             raw = _data
             lines = chatframe.parse_all(raw)
@@ -316,6 +316,9 @@ def watch(on_message, stop=None, on_ready=None, proc_holder=None,
                         continue
                 except Exception:
                     pass
+                if on_disconnect and ready_sent:
+                    on_disconnect()
+                    ready_sent = False
                 break                                     # client exited -> re-attach
         finally:
             handle.terminate()

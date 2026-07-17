@@ -171,7 +171,7 @@ def main() -> int:
     # ------------------------
     my_name = playername.detect(args.me)
 
-    SYS, SYS_HTML, MSG = object(), object(), object()
+    SYS, SYS_HTML, SYS_LOG, MSG = object(), object(), object(), object()
     inbox: queue.Queue = queue.Queue()
     stop = threading.Event()
     proc_holder: list = []               # holds the elevated capture process (Linux)
@@ -199,12 +199,14 @@ def main() -> int:
                 use_quiche = receiver_quiche_win.available()
             except Exception:
                 use_quiche = False
+
         if use_quiche:
             scanner = threading.Thread(
                 target=receiver_quiche_win.watch,
                 kwargs=dict(
                     on_message=lambda m: inbox.put((MSG, m)),
                     on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Capturing Chat</span>')),
+                    on_disconnect=lambda: inbox.put((SYS_LOG, '<span style="color:#ff4444; font-weight:bold;">Hychat Disconnected - No longer capturing chat</span>')),
                     stop=stop, proc_holder=proc_holder, my_name=my_name,
                     show_system=args.show_system, tunnel_only=args.tunnel_only,
                     debug_log=os.environ.get("HYTALE_DEBUG")),
@@ -235,6 +237,7 @@ def main() -> int:
                 kwargs=dict(
                     on_message=_memscan_on_message,
                     on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Watching for Messages</span>')),
+                    on_disconnect=lambda: inbox.put((SYS_LOG, '<span style="color:#ff4444; font-weight:bold;">Hychat Disconnected - No longer capturing chat</span>')),
                     interval=args.interval, sweep_interval=args.sweep,
                     max_region=args.max_region, seen=seen, workers=args.workers, stop=stop),
                 daemon=True,
@@ -271,6 +274,8 @@ def main() -> int:
                     ui.add_system(payload)
                 elif tag is SYS_HTML:
                     ui.add_system_html(payload)
+                elif tag is SYS_LOG:
+                    ui.add_system_log(payload)
                 else:
                     if payload.kind in ("whisper_in", "whisper_out"):
                         hs = crypto.parse_hs_token(payload.body)
@@ -335,7 +340,26 @@ def main() -> int:
                                '\\party create — Create a new party<br>'
                                '\\party invite &lt;friend&gt; — Invite friend to party<br>'
                                '\\gif &lt;url&gt; — Send an encrypted GIF<br>'
+                               '\\reboot — Restart the tunnel<br>'
                                '\\exit — Close down the tunnel</span>')
+            return
+        if text.lower() == r"\reboot":
+            import subprocess, os
+            args = sys.argv[1:]
+            
+            if getattr(sys, 'frozen', False):
+                # Running as compiled PyInstaller .exe
+                subprocess.Popen([sys.executable] + args, cwd=os.path.dirname(sys.executable))
+            elif sys.platform == "win32":
+                # Running from source on Windows
+                bat_path = os.path.join(os.path.dirname(__file__), "hytale-tunnel.bat")
+                subprocess.Popen([bat_path] + args, creationflags=subprocess.CREATE_NEW_CONSOLE, cwd=os.path.dirname(__file__))
+            else:
+                # Running from source on Linux
+                sh_path = os.path.join(os.path.dirname(__file__), "..", "hytale-tunnel")
+                subprocess.Popen(["bash", sh_path] + args, cwd=os.path.dirname(sh_path))
+                
+            app.quit()
             return
         if text.lower() == r"\exit":
             app.quit()
@@ -636,7 +660,8 @@ def main() -> int:
         f'{_fmt_hk(args.hotkey_open)} - Open Chat<br>'
         f'{_fmt_hk(args.hotkey_close)} - Minimize Tunnel<br>'
         f'{_fmt_hk(args.hotkey_unfocus)} - Game Focus<br>'
-        '\\gif "Link" - Send GIF'
+        '\\gif "Link" - Send GIF<br>'
+        '\\Help - More Commands'
         '</span>'
     )
     ui.add_system_html(instructions)

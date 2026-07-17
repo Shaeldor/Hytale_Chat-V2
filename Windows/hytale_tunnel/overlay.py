@@ -421,6 +421,11 @@ class Overlay(QtWidgets.QWidget):
         else:
             self._hud_add(html_text)
 
+    def add_system_log(self, html_text: str) -> None:
+        self._entries.append(("sys_log", html_text))
+        if self._opened:
+            self._append_html(html_text)
+
     def _format_system(self, text: str) -> str:
         return f'<span style="color:{self._C_SYS}">· {html.escape(text)}</span>'
 
@@ -614,6 +619,7 @@ class Overlay(QtWidgets.QWidget):
             self.btn_decrypt.setVisible(False)
             for b in (self.emoji_btn, self.gif_btn, self.friends_btn):
                 b.setVisible(False)
+            self.update_btn.setVisible(self.update_btn.isEnabled())
             self.hud.setVisible(True)
             return
         chrome = self._opened
@@ -624,6 +630,7 @@ class Overlay(QtWidgets.QWidget):
         self.btn_decrypt.setVisible(chrome)
         for b in (self.emoji_btn, self.gif_btn, self.friends_btn):
             b.setVisible(chrome)
+        self.update_btn.setVisible(chrome)
         self.body.setVisible(True)
         self.view.setVisible(self._opened)       # opened -> scrollable history
         self.hud.setVisible(not self._opened)    # passive -> fading HUD
@@ -705,7 +712,7 @@ class Overlay(QtWidgets.QWidget):
         for kind, payload in self._entries:
             if kind == "sys":
                 self.view.append(self._format_system(payload))
-            elif kind == "sys_html":
+            elif kind in ("sys_html", "sys_log"):
                 self.view.append(payload)
             elif self._passes(payload):
                 if getattr(payload, "is_gif", False):
@@ -907,6 +914,7 @@ class Overlay(QtWidgets.QWidget):
             "QPushButton{color:#55ff55; background:rgba(34,34,34,40);"
             "border:1px solid #55ff55; border-radius:4px; padding:2px 6px;}"
             " QPushButton:hover{background:rgba(44,49,60,150);}")
+        self._sync_visibility()
 
     def _check_for_updates(self) -> None:
         import sys

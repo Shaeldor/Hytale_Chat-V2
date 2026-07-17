@@ -266,7 +266,7 @@ def mark_all_seen(pid: int | None = None) -> int:
 
 
 def watch(on_message, interval=0.2, sweep_interval=3.0, max_region=None,
-          on_ready=None, seen=None, workers=4, pid_getter=find_client_pid, stop=None):
+          on_ready=None, on_disconnect=None, seen=None, workers=4, pid_getter=find_client_pid, stop=None):
     """Two-tier poll loop. Calls on_message(sender, plaintext) for each new *received*
     message (deduped forever by the persistent ledger).
 
@@ -295,6 +295,9 @@ def watch(on_message, interval=0.2, sweep_interval=3.0, max_region=None,
 
     while stop is None or not stop.is_set():
         if pid is None:
+            if ready_sent and on_disconnect:
+                on_disconnect()
+                ready_sent = False
             pid, hot = pid_getter(), []
             if pid is None:
                 time.sleep(interval)
