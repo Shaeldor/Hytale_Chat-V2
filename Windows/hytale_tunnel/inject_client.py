@@ -11,7 +11,7 @@ def lines_for(mode: str, target: str | None, message: str) -> list[str]:
     """Produce the ready-to-send chat line(s) for a compose-box message (may chunk)."""
     if mode == "private":
         return [f"/msg {target} {t}" for t in crypto.encrypt_messages(target, message)]
-    if mode == "party":
+    if mode in ("party", "party_private"):
         return [f"{crypto.PARTY_PREFIX}{t}" for t in crypto.encrypt_group_messages(target, message)]
     return crypto.split_public_lines(message)       # public: raw, but split to fit CHAT_LIMIT
 

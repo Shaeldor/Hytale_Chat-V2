@@ -12,3 +12,11 @@ venv/
 seen.log
 tunnel.pid
 *.pid
+
+# PyInstaller & Build Outputs
+build/
+dist/
+*.spec
+Compiled_HyChat/
+launcher.py
+*.zip

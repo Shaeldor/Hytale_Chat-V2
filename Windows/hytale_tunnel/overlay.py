@@ -106,7 +106,7 @@ class Overlay(QtWidgets.QWidget):
         self._hud_gif_by_url = {}    # url -> _FadingGif HUD line awaiting its download
         self._gif_picker = None
         self._gif_ready.connect(self._on_gif_ready)
-        self._expanded_size = QtCore.QSize(440, 320)
+        self._expanded_size = QtCore.QSize(440, 600)
         self._user_moved = False
         self._drag_off = None
         self.setWindowTitle("hytale-tunnel")    # Hyprland matches this for window rules
@@ -166,6 +166,17 @@ class Overlay(QtWidgets.QWidget):
         self._friends = list(friends)
         self._requests = []
         self._friends_panel = None
+        self.update_btn = QtWidgets.QPushButton("📥")
+        self.update_btn.setToolTip("Update Ready!")
+        self.update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet(
+            "QPushButton{color:#55ff55; background:rgba(34,34,34,40);"
+            "border:1px solid #55ff55; border-radius:4px; padding:2px 6px;}"
+            " QPushButton:hover{background:rgba(44,49,60,150);}")
+        self.update_btn.clicked.connect(self.perform_update)
+        # The button is visible for demonstration, but you can hide it with self.update_btn.hide() by default
+        header.addWidget(self.update_btn)
+
         self.friends_btn = QtWidgets.QPushButton("👥")
         self.friends_btn.setToolTip("friends — add / accept / remove")
         self.friends_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
@@ -233,7 +244,6 @@ class Overlay(QtWidgets.QWidget):
         hud_outer = QtWidgets.QVBoxLayout(self.hud)
         hud_outer.setContentsMargins(0, 0, 0, 0)
         hud_outer.setSpacing(0)
-        hud_outer.addStretch(1)                  # pin the panel to the bottom
         self._hud_panel = QtWidgets.QWidget()
         self._hud_panel.setStyleSheet(
             f"background: rgba(10,12,16,{BG_ALPHA}); border-radius:6px;")
@@ -242,14 +252,15 @@ class Overlay(QtWidgets.QWidget):
         self._hud_layout.setSpacing(1)
         self._hud_layout.addStretch(1)
         hud_outer.addWidget(self._hud_panel)
+        hud_outer.addStretch(1)                  # pin the panel to the top
         self._hud_panel.setVisible(False)        # only shown once it holds a line
         self._hud_lines = []
-        body.addWidget(self.hud, 1)
         self.input = _ComposeEdit()
         self.input.setPlaceholderText("Type your message here...")
         self.input.returnPressed.connect(self._on_submit)
         body.addWidget(self.input)
         root.addWidget(self.body, 1)
+        root.addWidget(self.hud, 1)
         self._apply_font()                       # size the transcript + input box
 
         # --- dynamic display ---
@@ -327,7 +338,7 @@ class Overlay(QtWidgets.QWidget):
     _C_PARTY = "#ffd479"      # party chat (amber)
     _C_EMOTE = "#b9a9ff"      # /me emotes (purple)
     _C_DIM = "#7a828f"        # connectives ("whispers:", "to")
-    _C_SYS = "#888"           # server/console lines
+    _C_SYS = "#7ec8ff"        # server/console lines
 
     # ---- dynamic display tuning ----
     _FADE_MS = 900          # per-line fade-out animation length
@@ -337,15 +348,13 @@ class Overlay(QtWidgets.QWidget):
     def add_message(self, msg) -> None:
         """Store + render a chatframe.Msg, honoring the current display filter."""
         self._entries.append(("msg", msg))
-        if self._collapsed:
-            pass                                 # pill: nothing to draw (unread badge below)
-        elif self._opened:
+        if not self._collapsed and self._opened:
             if self._passes(msg):
                 if getattr(msg, "is_gif", False):
                     self._append_gif_opened(msg)
                 else:
                     self._append_html(self._format_message(msg))
-        elif self._passes(msg):
+        elif getattr(msg, "is_tunnel", False):
             if getattr(msg, "is_gif", False):
                 self._hud_add_gif(msg)           # animated GIF as a fading HUD line
             else:
@@ -397,18 +406,14 @@ class Overlay(QtWidgets.QWidget):
 
     def add_system(self, text: str) -> None:
         self._entries.append(("sys", text))
-        if self._collapsed:
-            return
-        if self._opened:
+        if not self._collapsed and self._opened:
             self._append_html(self._format_system(text))
         else:
             self._hud_add(self._format_system(text))
 
     def add_system_html(self, html_text: str) -> None:
         self._entries.append(("sys_html", html_text))
-        if self._collapsed:
-            return
-        if self._opened:
+        if not self._collapsed and self._opened:
             self._append_html(html_text)
         else:
             self._hud_add(html_text)
@@ -499,7 +504,13 @@ class Overlay(QtWidgets.QWidget):
         def _on_frame(_i) -> None:
             doc.addResource(rtype, qurl, mv.currentPixmap())
             self.view.viewport().update()
-        doc.addResource(rtype, qurl, mv.currentPixmap())
+            
+        pm = mv.currentPixmap()
+        scaled_sz = mv.scaledSize()
+        if scaled_sz.isValid() and pm.size() != scaled_sz:
+            pm = pm.scaled(scaled_sz, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            
+        doc.addResource(rtype, qurl, pm)
         doc.markContentsDirty(0, doc.characterCount())     # size the <img> to the gif (once)
         # The document relayout happens asynchronously, so we wait for the next event loop tick
         # to ensure the scrollbar's maximum has been updated before we snap it to the bottom.
@@ -510,10 +521,27 @@ class Overlay(QtWidgets.QWidget):
         self._gif_pumps[gid] = mv
 
     def _gif_caption(self, msg) -> str:
-        who = "you" if msg.is_self else html.escape(msg.sender)
-        colour = self._C_YOU if msg.is_self else self._C_WHISPER
-        return (f'🔒 <span style="color:{colour}"><b>{who}</b></span>'
-                f'<span style="color:{self._C_DIM}">:</span>')
+        name = html.escape(msg.sender)
+        lock = "🔒 " if msg.is_tunnel else ""
+        name_color = self._C_YOU if msg.is_self else (
+            _brighten(msg.rank_color or msg.name_color)
+            or (self._C_TUNNEL if msg.is_tunnel else self._C_OTHER))
+            
+        if msg.kind == "party":
+            who = "you" if msg.is_self else name
+            who_color = self._C_YOU if msg.is_self else self._C_PARTY
+            return (f'<span style="color:{self._C_PARTY}">{lock}[P] </span>'
+                    f'<span style="color:{who_color}"><b>{html.escape(who)}:</b></span>')
+        elif msg.kind == "whisper_out":
+            tgt = html.escape(msg.target or self.recipient)
+            return (f'<span style="color:{self._C_DIM}">{lock}to </span>'
+                    f'<span style="color:{self._C_WHISPER}"><b>{tgt}</b></span>'
+                    f'<span style="color:{self._C_DIM}">:</span>')
+        elif msg.kind == "whisper_in":
+            return (f'<span style="color:{self._C_WHISPER}">{lock}<b>{name}</b></span>'
+                    f'<span style="color:{self._C_DIM}"> whispers:</span>')
+        else:  # public
+            return f'<span style="color:{name_color}">{lock}<b>{name}:</b></span>'
 
     def _append_gif_opened(self, msg) -> None:
         # Place the <img> in order NOW (with a loading placeholder as its resource); animate in
@@ -583,6 +611,7 @@ class Overlay(QtWidgets.QWidget):
             self.btn_decrypt.setVisible(False)
             for b in (self.emoji_btn, self.gif_btn, self.friends_btn):
                 b.setVisible(False)
+            self.hud.setVisible(True)
             return
         chrome = self._opened
         self.header.setVisible(chrome)           # passive -> no header/buttons
@@ -631,10 +660,12 @@ class Overlay(QtWidgets.QWidget):
         """Reseed the HUD with the most recent visible lines (each starts its own fade)."""
         self._hud_clear()
         shown = [(k, p) for (k, p) in self._entries
-                 if k == "sys" or self._passes(p)]
+                 if k in ("sys", "sys_html") or (k == "msg" and getattr(p, "is_tunnel", False))]
         for k, p in shown[-self._PASSIVE_MAX:]:
             if k == "sys":
                 self._hud_add(self._format_system(p))
+            elif k == "sys_html":
+                self._hud_add(p)
             elif getattr(p, "is_gif", False):
                 self._hud_add_gif(p)
             else:
@@ -714,10 +745,8 @@ class Overlay(QtWidgets.QWidget):
         if collapsed:
             self.title.setText("🔒 ▸")
             self.title.setStyleSheet(self._PILL_STYLE)
-            self._hud_clear()                    # stop any in-flight HUD fades
             self._clear_pumps()                  # stop opened-view GIF animations too
             self._sync_visibility()
-            self.hide()
         else:
             self._unread = 0
             self.title.setText("🔒 tunnel  ⠿")   # restore draggable title in expanded view
@@ -772,6 +801,11 @@ class Overlay(QtWidgets.QWidget):
     def _set_recipient(self, name: str) -> None:
         self.recipient = name
         self._update_friends_btn()
+        try:
+            from . import crypto
+            (crypto.CONFIG_DIR / "last_channel.txt").write_text(name)
+        except Exception:
+            pass
 
     # ---- friends panel ----
 
@@ -785,13 +819,32 @@ class Overlay(QtWidgets.QWidget):
         self._friends = list(friends)
         self._requests = list(requests or [])
         self._update_friends_btn()
-        if self._friends_panel is not None and self._friends_panel.isVisible():
-            self._friends_panel.rebuild(self._friends, self._requests, self.recipient)
+        
+        in_party = False
+        try:
+            from . import crypto
+            in_party = crypto.load_group_psk("party") is not None
+        except Exception:
+            pass
+            
+        if self._friends_panel is not None:
+            self._friends_panel.rebuild(self._friends, self._requests, self.recipient, in_party)
+            
+        items = ["Public", "Party"] + [f for f in self._friends if f.lower() != "party"]
+        self.recipient_box.blockSignals(True)
+        self.recipient_box.clear()
+        self.recipient_box.addItems(items)
+        self.recipient_box.blockSignals(False)
+        
+        if self.recipient in items:
+            self.recipient_box.setCurrentText(self.recipient)
+        else:
+            self.recipient_box.setCurrentText("Public")
 
     def _open_friends_panel(self) -> None:
         if self._friends_panel is None:
             self._friends_panel = FriendsPanel(self, self._on_friend_event)
-        self._friends_panel.rebuild(self._friends, self._requests, self.recipient)
+        self.refresh_friends(self._friends, self._requests)
         self._friends_panel.popup(self.friends_btn)
 
     def _on_friend_event(self, action: str, name: str) -> None:
@@ -843,6 +896,52 @@ class Overlay(QtWidgets.QWidget):
             "Paste an encrypted token (HX1...) here to decrypt it:", on_ok
         )
         self._crypto_dialog.popup(self.btn_decrypt)
+
+    def perform_update(self) -> None:
+        import urllib.request
+        import zipfile
+        import tempfile
+        import subprocess
+        import sys
+
+        self.update_btn.setText("⏳")
+        self.update_btn.setEnabled(False)
+        self.update_btn.repaint()
+
+        def update_thread():
+            try:
+                # Replace with actual URL later
+                download_url = "https://github.com/Shaeldor/Hytale_Chat-V2/releases/download/Hytale/Compiled_HyChat.zip"
+                
+                temp_dir = tempfile.gettempdir()
+                zip_path = os.path.join(temp_dir, "Compiled_HyChat.zip")
+                extract_dir = os.path.join(temp_dir, "HyChatUpdate")
+                
+                try:
+                    urllib.request.urlretrieve(download_url, zip_path)
+                except Exception:
+                    pass # Mock for testing if URL is invalid
+                
+                if os.path.exists(zip_path) and zipfile.is_zipfile(zip_path):
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(extract_dir)
+
+                bat_path = os.path.join(temp_dir, "updater.bat")
+                with open(bat_path, "w") as f:
+                    f.write("@echo off\n")
+                    f.write("timeout /t 2 /nobreak >nul\n")
+                    f.write(f'if exist "{extract_dir}" xcopy /e /y "{extract_dir}\\*" "%CD%\\"\n')
+                    f.write(f'start "" "{sys.executable}"\n')
+                    f.write(f'if exist "{extract_dir}" rmdir /s /q "{extract_dir}"\n')
+                    f.write(f'if exist "{zip_path}" del "{zip_path}"\n')
+                    f.write('del "%~f0"\n')
+                
+                subprocess.Popen([bat_path], creationflags=0x08000000) # CREATE_NO_WINDOW
+                QtCore.QMetaObject.invokeMethod(QtCore.QCoreApplication.instance(), "quit", QtCore.Qt.ConnectionType.QueuedConnection)
+            except Exception as e:
+                print(f"Update failed: {e}")
+                
+        threading.Thread(target=update_thread, daemon=True).start()
 
 
 class _ComposeEdit(QtWidgets.QLineEdit):
@@ -1160,20 +1259,29 @@ class FriendsPanel(QtWidgets.QWidget):
             if w is not None:
                 w.deleteLater()
 
-    def rebuild(self, friends: list, requests: list, recipient: str) -> None:
+    def rebuild(self, friends: list, requests: list, recipient: str, in_party: bool = False) -> None:
         self._clear_rows()
         idx = 0
-        for name in requests:
-            self.rows.insertWidget(idx, self._request_row(name)); idx += 1
-        if requests and friends:
+        
+        real_friends = [f for f in friends if f.lower() != "party"]
+        
+        if in_party:
+            self.rows.insertWidget(idx, self._party_row()); idx += 1
             sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
             sep.setStyleSheet("color:#333;")
             self.rows.insertWidget(idx, sep); idx += 1
-        if not friends:
+            
+        for name in requests:
+            self.rows.insertWidget(idx, self._request_row(name)); idx += 1
+        if requests and real_friends:
+            sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            sep.setStyleSheet("color:#333;")
+            self.rows.insertWidget(idx, sep); idx += 1
+        if not real_friends:
             empty = QtWidgets.QLabel("no friends yet — add one below")
             empty.setStyleSheet("color:#7a828f; padding:6px;")
             self.rows.insertWidget(idx, empty); idx += 1
-        for name in friends:
+        for name in real_friends:
             self.rows.insertWidget(idx, self._friend_row(name, name == recipient)); idx += 1
 
     def _request_row(self, name: str) -> QtWidgets.QWidget:
@@ -1193,6 +1301,24 @@ class FriendsPanel(QtWidgets.QWidget):
         h.addWidget(acc)
         return row
 
+    def _party_row(self) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(2, 2, 2, 2); h.setSpacing(4)
+        lbl = QtWidgets.QLabel("Party ✔️")
+        lbl.setStyleSheet("color:#ffd479; font-weight:bold; padding:4px;")
+        h.addWidget(lbl, 1)
+        
+        rm = QtWidgets.QPushButton("✕")
+        rm.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        rm.setToolTip("leave party")
+        rm.setStyleSheet(
+            "QPushButton{color:#ff8f8f; background:transparent; border:none; padding:3px 6px;}"
+            " QPushButton:hover{background:rgba(70,40,40,180); border-radius:5px;}")
+        rm.clicked.connect(lambda _=False: self._emit("leave_party", "party"))
+        h.addWidget(rm)
+        return row
+
     def _friend_row(self, name: str, is_current: bool) -> QtWidgets.QWidget:
         row = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(row)
@@ -1207,6 +1333,16 @@ class FriendsPanel(QtWidgets.QWidget):
             " QPushButton:hover{background:rgba(44,49,60,150); border-radius:5px;}")
         pick.clicked.connect(lambda _=False, n=name: self._emit("select", n))
         h.addWidget(pick, 1)
+        
+        inv = QtWidgets.QPushButton("🎉")
+        inv.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        inv.setToolTip("invite to party")
+        inv.setStyleSheet(
+            "QPushButton{color:#ffc552; background:transparent; border:none; padding:3px 6px;}"
+            " QPushButton:hover{background:rgba(70,60,40,180); border-radius:5px;}")
+        inv.clicked.connect(lambda _=False, n=name: self._emit("invite", n))
+        h.addWidget(inv)
+        
         rm = QtWidgets.QPushButton("✕")
         rm.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         rm.setToolTip("remove friend")

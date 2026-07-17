@@ -7,6 +7,8 @@ import argparse
 import os
 import queue
 import signal
+import base64
+import html
 import sys
 import threading
 
@@ -24,8 +26,8 @@ def _parse_command(text: str, last_contact: dict, channel: str):
     if channel == "Public":
         return "public", None, text
     elif channel.lower() == "party":
-        if crypto.load_group_key("party") is None:
-            return "error", None, "no 'party' key set in groups. Run: hytalecrypt setkey party <key>"
+        if crypto.load_group_psk("party") is None:
+            return "error", None, "no 'party' key set in groups. Run: hytalecrypt setgroupkey party <key>"
         return "party_private", "party", text
     else:
         # A specific friend is selected
@@ -109,6 +111,7 @@ def main() -> int:
         print(f"Marked {n} message(s) as seen; they won't appear in the overlay.")
         return 0
 
+    crypto.ensure_dirs()
     friends = crypto.list_psk_friends()
     if not friends:
         print("No shared keys yet. Set one up:\n"
@@ -132,9 +135,43 @@ def main() -> int:
 
     ui = Overlay(recipient, friends, font_px=font_size)
 
+    # --- System Tray Icon ---
+    tray_icon = QtWidgets.QSystemTrayIcon(app)
+    pm = QtGui.QPixmap(32, 32)
+    pm.fill(QtGui.QColor("transparent"))
+    painter = QtGui.QPainter(pm)
+    painter.setBrush(QtGui.QColor("#55ff55"))
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    painter.drawRoundedRect(2, 2, 28, 28, 6, 6)
+    painter.setPen(QtGui.QColor("#000000"))
+    font = painter.font()
+    font.setPointSize(16)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pm.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "H")
+    painter.end()
+    
+    tray_icon.setIcon(QtGui.QIcon(pm))
+    tray_icon.setToolTip("HyChat")
+    
+    tray_menu = QtWidgets.QMenu()
+    show_action = tray_menu.addAction("Show / Hide")
+    def toggle_ui():
+        if ui.isHidden():
+            ui.show()
+        else:
+            ui.hide()
+    show_action.triggered.connect(toggle_ui)
+    
+    quit_action = tray_menu.addAction("Quit")
+    quit_action.triggered.connect(app.quit)
+    
+    tray_icon.setContextMenu(tray_menu)
+    tray_icon.show()
+    # ------------------------
     my_name = playername.detect(args.me)
 
-    SYS, MSG = object(), object()
+    SYS, SYS_HTML, MSG = object(), object(), object()
     inbox: queue.Queue = queue.Queue()
     stop = threading.Event()
     proc_holder: list = []               # holds the elevated capture process (Linux)
@@ -148,7 +185,7 @@ def main() -> int:
             target=receiver_quiche.watch,
             kwargs=dict(
                 on_message=lambda m: inbox.put((MSG, m)),
-                on_ready=lambda: inbox.put((SYS, "ready — capturing chat (quiche)")),
+                on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Capturing Chat</span>')),
                 stop=stop, proc_holder=proc_holder, my_name=my_name,
                 show_system=args.show_system, tunnel_only=args.tunnel_only,
                 debug_log=os.environ.get("HYTALE_DEBUG")),
@@ -167,7 +204,7 @@ def main() -> int:
                 target=receiver_quiche_win.watch,
                 kwargs=dict(
                     on_message=lambda m: inbox.put((MSG, m)),
-                    on_ready=lambda: inbox.put((SYS, "ready — capturing chat (quiche)")),
+                    on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Capturing Chat</span>')),
                     stop=stop, proc_holder=proc_holder, my_name=my_name,
                     show_system=args.show_system, tunnel_only=args.tunnel_only,
                     debug_log=os.environ.get("HYTALE_DEBUG")),
@@ -197,7 +234,7 @@ def main() -> int:
                 target=memscan.watch,
                 kwargs=dict(
                     on_message=_memscan_on_message,
-                    on_ready=lambda: inbox.put((SYS, "ready — watching for messages")),
+                    on_ready=lambda: inbox.put((SYS_HTML, '<span style="color:#4ade80;">Ready - Watching for Messages</span>')),
                     interval=args.interval, sweep_interval=args.sweep,
                     max_region=args.max_region, seen=seen, workers=args.workers, stop=stop),
                 daemon=True,
@@ -232,7 +269,43 @@ def main() -> int:
                 tag, payload = inbox.get_nowait()
                 if tag is SYS:
                     ui.add_system(payload)
+                elif tag is SYS_HTML:
+                    ui.add_system_html(payload)
                 else:
+                    if payload.kind in ("whisper_in", "whisper_out"):
+                        hs = crypto.parse_hs_token(payload.body)
+                        if hs:
+                            marker, their_pub = hs
+                            if payload.kind == "whisper_in":
+                                if marker == crypto.HS_ADD:
+                                    crypto.record_incoming_request(payload.sender, their_pub)
+                                    ui.add_system_html(f'<span style="color:#7ec8ff;">❗ Friend request from <b>{html.escape(payload.sender)}</b> — type <code>\\friend accept {html.escape(payload.sender)}</code></span>')
+                                    ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                                elif marker == crypto.HS_ACCEPT:
+                                    if crypto.has_outgoing_request(payload.sender):
+                                        crypto.clear_outgoing_request(payload.sender)
+                                        key = crypto.save_derived_friend_key(payload.sender, their_pub)
+                                        ui.add_system_html(f'<span style="color:#7ec8ff;">❗ Friend request accepted! You are now securely connected to <b>{html.escape(payload.sender)}</b>. '
+                                                      f'(Key fingerprint: {crypto.key_fingerprint(key)})</span>')
+                                        ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                            continue  # don't display the raw token (whether inbound or outbound)
+
+                        if payload.body.startswith(r"\party_invite "):
+                            if payload.kind == "whisper_in":
+                                parts = payload.body.split()
+                                if len(parts) == 3:
+                                    gname = parts[1]
+                                    gb64 = parts[2]
+                                    try:
+                                        raw_key = base64.b64decode(gb64)
+                                        if len(raw_key) == 32:
+                                            crypto.set_group_psk(gname, gb64)
+                                            ui.add_system_html(f'<span style="color:#7ec8ff;">🎉 <b>{html.escape(payload.sender)}</b> invited you to the party! You joined securely.</span>')
+                                            ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                                    except Exception:
+                                        pass
+                            continue  # hide the invite payload from chat view
+
                     ui.add_message(payload)
                     if payload.kind == "whisper_in" and not payload.is_self:
                         last_contact["name"] = payload.sender
@@ -247,17 +320,37 @@ def main() -> int:
         text = text.strip()
         if not text:
             return
-        
+        # Intercept commands typed in chat
+        if text.lower().startswith(r"\friend "):
+            _do_friend(text)
+            return
+        if text.lower().startswith(r"\party "):
+            _do_party(text)
+            return
+        if text.lower() == r"\help":
+            ui.add_system_html('<span style="color:#ffffff;"><b>Available Commands:</b><br>'
+                               '\\friend add &lt;player&gt; — Send a friend request<br>'
+                               '\\friend accept &lt;player&gt; — Accept a request<br>'
+                               '\\friend remove &lt;player&gt; — Remove a friend<br>'
+                               '\\party create — Create a new party<br>'
+                               '\\party invite &lt;friend&gt; — Invite friend to party<br>'
+                               '\\gif &lt;url&gt; — Send an encrypted GIF<br>'
+                               '\\exit — Close down the tunnel</span>')
+            return
+        if text.lower() == r"\exit":
+            ui.close()
+            return
+
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
         # the receiver overlay sees the magic bytes and displays it as a GIF.
         gif_url = ""
-        if text.split(None, 1)[0].lower() == "/gif":
-            gif_url = text[len("/gif"):].strip()
+        if text.split(None, 1)[0].lower() == r"\gif":
+            gif_url = text[len(r"\gif"):].strip()
             if not gif_util.valid_url(gif_url):
-                inbox.put((SYS, "usage: /gif <direct .gif URL> (http/https)"))
+                inbox.put((SYS, r"usage: \gif <direct .gif URL> (http/https)"))
                 return
-            if ui.recipient in ("Public", "Party"):
-                inbox.put((SYS, "select a friend you share a key with — GIFs go over the "
+            if ui.recipient == "Public":
+                inbox.put((SYS, "select a friend or party you share a key with — GIFs go over the "
                                 "encrypted tunnel (so they shouldn't go in Public chat!)"))
                 return
             gif_util.push_recent(gif_url)
@@ -412,11 +505,11 @@ def main() -> int:
             inbox.put((SYS, f"Decrypted (Key: {key_name}) but payload too short."))
 
     def _do_friend(text: str) -> None:
-        parts = text.split(None, 2)                  # ['/friend', 'add', 'Bob']
+        parts = text.split(None, 2)                  # ['\friend', 'add', 'Bob']
         sub = parts[1].lower() if len(parts) > 1 else ""
         name = parts[2].strip() if len(parts) > 2 else ""
         if sub not in ("add", "accept", "remove") or not name:
-            inbox.put((SYS, "usage: /friend add|accept|remove <player>"))
+            inbox.put((SYS, r"usage: \friend add|accept|remove <player>"))
             return
             
         # Helper to inject public message without typing
@@ -430,7 +523,7 @@ def main() -> int:
             crypto.record_outgoing_request(name)
             _send_line(f"/msg {name} {crypto.hs_add_token()}")
             inbox.put((SYS, f"friend request sent to {name} — have them run: "
-                            f"/friend accept {my_name or 'you'}"))
+                            rf"\friend accept {my_name or 'you'}"))
         elif sub == "accept":
             pub = crypto.take_incoming_request(name)
             if pub is None:
@@ -454,13 +547,81 @@ def main() -> int:
         elif action == "forget":
             gif_util.forget(url)
 
+    def _do_party(text: str) -> None:
+        parts = text.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        
+        if sub == "create":
+            group_name = "party"
+            import os, base64
+            from . import crypto
+            key_b64 = base64.b64encode(os.urandom(32)).decode("utf-8")
+            crypto.set_group_psk(group_name, key_b64)
+            inbox.put((SYS, f"Created new party! Invite friends with \\party invite <friend>"))
+            ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+            return
+            
+        if sub == "invite":
+            friend = parts[2] if len(parts) > 2 else ""
+            if not friend:
+                inbox.put((SYS, r"usage: \party invite <friend>"))
+                return
+            group_name = "party"
+            
+            group_key = crypto.load_group_psk(group_name)
+            if not group_key:
+                inbox.put((SYS, f"No group key for '{group_name}'. Set it up first using the CLI!"))
+                return
+            
+            key_b64 = base64.b64encode(group_key).decode("utf-8")
+            payload = f"\\party_invite {group_name} {key_b64}"
+            
+            try:
+                enc = crypto.encrypt_sym(friend, payload)
+            except KeyError:
+                inbox.put((SYS, f"You must be friends with {friend} first! Run \\friend add {friend}"))
+                return
+                
+            def _send_line(msg):
+                if injector:
+                    injector.send("public", None, msg)
+                else:
+                    send.send_public(msg, open_key=args.open_key, paste_method=args.paste_method, type_delay_ms=args.type_delay)
+                    
+            _send_line(f"/msg {friend} {enc}")
+            inbox.put((SYS, f"Party invite for '{group_name}' sent to {friend}!"))
+        else:
+            inbox.put((SYS, r"usage: \party invite <friend> [party_name]"))
+
     ui.custom_encrypt_requested.connect(on_custom_encrypt)
     ui.custom_decrypt_requested.connect(on_custom_decrypt)
     ui.submitted.connect(on_submit)
     ui.dismissed.connect(send.focus_game)
-    ui.friend_action.connect(lambda action, nm: _do_friend(f"/friend {action} {nm}"))
+    def _handle_friend_action(action: str, nm: str):
+        if action == "invite":
+            _do_party(rf"\party invite {nm}")
+        elif action == "leave_party":
+            from . import crypto
+            group_key = crypto.load_group_psk("party")
+            if group_key:
+                try:
+                    (crypto.GROUPS_DIR / "party.key").unlink(missing_ok=True)
+                except Exception:
+                    pass
+                inbox.put((SYS, "You left the party."))
+                ui.refresh_friends(crypto.list_psk_friends(), crypto.list_incoming_requests())
+                # Also clean up legacy friends/party.key if it exists
+                try:
+                    (crypto.FRIENDS_DIR / "party.pub").unlink(missing_ok=True)
+                    (crypto.FRIENDS_DIR / "party.key").unlink(missing_ok=True)
+                except Exception:
+                    pass
+        else:
+            _do_friend(rf"\friend {action} {nm}")
+            
+    ui.friend_action.connect(_handle_friend_action)
     ui.gif_action.connect(_do_gif_action)
-    ui.gif_send.connect(lambda url: on_submit("/gif " + url))
+    ui.gif_send.connect(lambda url: on_submit(r"\gif " + url))
 
     if memscan.find_client_pid() is None:
         ui.add_system("HytaleClient not running — waiting…")
@@ -471,10 +632,11 @@ def main() -> int:
     instructions = (
         '<span style="color:#00d8ff; font-weight:bold;">TUNNEL UP</span><br>'
         f'<span style="color:#8fd;">Friends: {", ".join(friends) if friends else "None"}</span><br>'
-        '<span style="color:#7a8190; font-size:12px;">'
+        '<span style="color:#ffffff; font-size:12px;">'
         f'{_fmt_hk(args.hotkey_open)} - Open Chat<br>'
         f'{_fmt_hk(args.hotkey_close)} - Minimize Tunnel<br>'
-        f'{_fmt_hk(args.hotkey_unfocus)} - Game Focus'
+        f'{_fmt_hk(args.hotkey_unfocus)} - Game Focus<br>'
+        '\\gif "Link" - Send GIF'
         '</span>'
     )
     ui.add_system_html(instructions)

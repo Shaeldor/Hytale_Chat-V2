@@ -26,7 +26,7 @@ if not defined PYEXE (
 REM 3) last resort: plain "python" on PATH (may be the Store stub).
 if not defined PYEXE set "PYEXE=python"
 
-"%PYEXE%" -c "import sys,os; sys.path.insert(0, os.path.abspath(r'%PKG_PARENT%')); from hytale_tunnel.app import main; raise SystemExit(main())" %*
+"%PYEXE%" -c "import sys,os; sys.path.insert(0, os.path.abspath(r'%PKG_PARENT%')); from hytale_tunnel.app import main; raise SystemExit(main())" %* 2> "%PKG_PARENT%\crash_log.txt"
 if errorlevel 1 (
   echo.
   echo Could not start. If Python is missing or the packages aren't installed,
