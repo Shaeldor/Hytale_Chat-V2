@@ -340,6 +340,7 @@ def main() -> int:
                                '\\party create — Create a new party<br>'
                                '\\party invite &lt;friend&gt; — Invite friend to party<br>'
                                '\\gif &lt;url&gt; — Send an encrypted GIF<br>'
+                               '\\update — Update to the latest release<br>'
                                '\\reboot — Restart the tunnel<br>'
                                '\\exit — Close down the tunnel</span>')
             return
@@ -363,6 +364,33 @@ def main() -> int:
             return
         if text.lower() == r"\exit":
             app.quit()
+            return
+        if text.lower() == r"\update":
+            def _do_update_check():
+                import urllib.request, json, sys, os
+                local_hash = None
+                if hasattr(sys, "_MEIPASS"):
+                    cfile = os.path.join(sys._MEIPASS, "commit.txt")
+                    if os.path.exists(cfile):
+                        with open(cfile, "r") as f:
+                            local_hash = f.read().strip()
+                if not local_hash:
+                    inbox.put((SYS, "Running from source — update check disabled."))
+                    return
+                try:
+                    req = urllib.request.Request(
+                        "https://api.github.com/repos/Shaeldor/Hytale_Chat-V2/commits/main",
+                        headers={'User-Agent': 'Hytale-Chat'}
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        remote_hash = json.loads(response.read().decode()).get("sha", "").strip()
+                    if remote_hash and not remote_hash.startswith(local_hash):
+                        QtCore.QMetaObject.invokeMethod(ui, "perform_update", QtCore.Qt.ConnectionType.QueuedConnection)
+                    else:
+                        inbox.put((SYS, "Already on the latest version!"))
+                except Exception as e:
+                    inbox.put((SYS, f"Failed to check: {e}"))
+            threading.Thread(target=_do_update_check, daemon=True).start()
             return
 
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";

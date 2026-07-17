@@ -953,8 +953,27 @@ class Overlay(QtWidgets.QWidget):
         import sys
         import json
 
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("Update Available")
+        msg.setText("Would you like to update and reboot?")
+        msg.setStyleSheet(
+            "QMessageBox { background: rgba(18,21,27,245); color: #fff; } "
+            "QLabel { color: #fff; } "
+            "QPushButton { background: rgba(34,40,34,120); color: #9bf6a0; border: 1px solid #3a4150; border-radius: 6px; padding: 4px 12px; } "
+            "QPushButton:hover { background: rgba(44,60,44,180); }"
+        )
+        msg.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        msg.button(QtWidgets.QMessageBox.StandardButton.No).setText("Later")
+        
+        if msg.exec() != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
         self.update_btn.setText("⏳")
         self.update_btn.setEnabled(False)
+        self.update_btn.setStyleSheet(
+            "QPushButton{color:#888; background:rgba(34,34,34,40);"
+            "border:1px solid #555; border-radius:4px; padding:2px 6px;}"
+        )
         self.update_btn.repaint()
 
         def update_thread():
