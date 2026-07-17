@@ -338,7 +338,7 @@ def main() -> int:
                                '\\exit — Close down the tunnel</span>')
             return
         if text.lower() == r"\exit":
-            ui.close()
+            app.quit()
             return
 
         # A GIF is a normal ENCRYPTED private message whose plaintext is "HXG1 <url>";
@@ -686,6 +686,7 @@ def main() -> int:
     try:
         return app.exec()
     finally:
+        tray_icon.hide()
         if not getattr(ui, "_collapsed", False):
             settings.setValue("geometry", ui.saveGeometry())
         settings.setValue("font_size", ui._font_px)
