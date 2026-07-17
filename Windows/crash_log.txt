@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-    import sys,os; sys.path.insert(0, os.path.abspath(r'C:\Users\joshu\Documents\Antigravity MemBank\Hytale_Chat\Windows_HyChat_edit\hytale_tunnel\..')); from hytale_tunnel.app import main; raise SystemExit(main())
-                                                                                                                                                                                                               ~~~~^^
-  File "C:\Users\joshu\Documents\Antigravity MemBank\Hytale_Chat\Windows_HyChat_edit\hytale_tunnel\app.py", line 140, in main
-    pm = QtGui.QPixmap(32, 32)
-         ^^^^^
-NameError: name 'QtGui' is not defined

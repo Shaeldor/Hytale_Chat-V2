@@ -12,7 +12,7 @@ import html
 import sys
 import threading
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtWidgets, QtGui
 
 from . import chatframe, crypto, memscan, playername, send, gif_util
 from .chatframe import Msg
